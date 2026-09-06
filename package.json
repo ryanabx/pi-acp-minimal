@@ -1,0 +1,47 @@
+{
+	"name": "pi-acp-minimal",
+	"version": "1.0.0",
+	"description": "Agent Client Protocol (ACP) adapter for the pi coding agent",
+	"license": "MPL-2.0",
+	"type": "module",
+	"bin": {
+		"pi-acp-minimal": "dist/cli.js"
+	},
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist",
+		"npm-shrinkwrap.json"
+	],
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"dev": "tsx src/cli.ts",
+		"check": "tsc -p tsconfig.json --noEmit && npm run check:deps",
+		"check:deps": "node scripts/check-deps.mjs",
+		"check:package": "node scripts/check-package.mjs",
+		"audit": "npm audit --omit=dev && npm audit signatures --omit=dev",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"prepare": "npm run build"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"tsx": "4.22.1",
+		"typescript": "5.9.3",
+		"vitest": "3.2.7"
+	},
+	"dependencies": {
+		"@agentclientprotocol/sdk": "1.4.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ryanabx/pi-acp-minimal.git"
+	},
+	"bugs": {
+		"url": "https://github.com/ryanabx/pi-acp-minimal/issues"
+	},
+	"homepage": "https://github.com/ryanabx/pi-acp-minimal#readme"
+}

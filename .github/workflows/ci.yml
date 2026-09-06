@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Dependencies must never run install scripts here: the lockfile is the
+      # ground truth, and nothing in the runtime tree needs a build step.
+      - run: npm ci --ignore-scripts
+
+      - run: npm run check
+      - run: npm test
+      - run: npm run check:package
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+
+      # Runtime dependencies are what ships to users, so those must be clean.
+      - run: npm audit --omit=dev
+      - run: npm audit signatures --omit=dev
+
+      # Dev advisories are reported but do not fail the build: they cannot reach
+      # a user of the published package.
+      - run: npm audit || true
