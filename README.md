@@ -75,7 +75,7 @@ model list.
 
 | Option | Effect |
 |---|---|
-| `--pi-command <path>` | Executable used to launch pi (default: `$PI_ACP_PI_COMMAND`, else `pi`) |
+| `--pi-command <path>` | Executable used to launch pi (default: `$PI_ACP_PI_COMMAND`, else `pi` on `PATH`) |
 | `--model <pattern>` | Forwarded to pi as `--model` |
 | `--provider <name>` | Forwarded to pi as `--provider` |
 | `--session-dir <path>` | Forwarded to pi as `--session-dir` |

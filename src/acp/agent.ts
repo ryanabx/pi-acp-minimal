@@ -23,8 +23,8 @@ import { authRequired, internalError, invalidParams, resourceNotFound } from "./
 import { errorMessage, PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
 export interface PiAcpAgentOptions {
-	/** Executable used to launch pi. */
-	piCommand: string;
+	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
+	piCommand?: string;
 	/** Extra arguments passed to every `pi --mode rpc` process. */
 	piArgs: string[];
 	env?: NodeJS.ProcessEnv;

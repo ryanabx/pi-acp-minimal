@@ -12,7 +12,7 @@ The adapter speaks ACP over stdio and drives \`pi --mode rpc\` under the hood,
 so it is meant to be launched by an ACP client (Zed, Neovim, …) rather than by hand.
 
 Options:
-  --pi-command <path>   Executable used to launch pi (default: $PI_ACP_PI_COMMAND or "pi")
+  --pi-command <path>   Executable used to launch pi (default: $PI_ACP_PI_COMMAND or \`pi\` on PATH)
   --model <pattern>     Passed through to pi as --model
   --provider <name>     Passed through to pi as --provider
   --session-dir <path>  Passed through to pi as --session-dir
@@ -30,7 +30,7 @@ Example Zed configuration (settings.json):
 `;
 
 interface CliOptions {
-	piCommand: string;
+	piCommand?: string;
 	piArgs: string[];
 	quiet: boolean;
 	logFile?: string;
@@ -38,7 +38,7 @@ interface CliOptions {
 
 export function parseArgs(argv: string[]): CliOptions | { help: true } {
 	const options: CliOptions = {
-		piCommand: process.env.PI_ACP_PI_COMMAND ?? "pi",
+		piCommand: process.env.PI_ACP_PI_COMMAND,
 		piArgs: [],
 		quiet: false,
 		...(process.env.PI_ACP_LOG_FILE ? { logFile: process.env.PI_ACP_LOG_FILE } : {}),

@@ -40,7 +40,8 @@ export interface PiSessionOptions {
 	connection: AgentSideConnection;
 	clientCapabilities: ClientCapabilities | undefined;
 	cwd: string;
-	piCommand: string;
+	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
+	piCommand?: string;
 	piArgs: string[];
 	env?: NodeJS.ProcessEnv;
 	/** Existing pi session file to resume, for `session/load`. */

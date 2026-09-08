@@ -1,4 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { findOnPath } from "./find-executable.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import type {
 	PiExtensionUiRequest,
@@ -12,7 +13,7 @@ import type {
 } from "./rpc-types.js";
 
 export interface PiRpcClientOptions {
-	/** Executable to run. Defaults to `pi`. */
+	/** Executable to run. When omitted, `pi` is located on `PATH`. */
 	command?: string;
 	/** Arguments inserted before the adapter's own `--mode rpc`. */
 	args?: string[];
@@ -72,10 +73,21 @@ export class PiRpcClient {
 	start(): void {
 		if (this.#process) throw new Error("pi RPC client already started");
 
-		const command = this.#options.command ?? "pi";
+		let command = this.#options.command;
+		if (!command) {
+			const found = findOnPath("pi");
+			if (!found) throw new Error("No pi command was specified and no `pi` executable was found on PATH");
+			command = found;
+		}
 		const args = [...(this.#options.args ?? []), "--mode", "rpc"];
 
+		// Windows batch/sh shim files (.cmd/.bat, which is what npm global installs
+		// resolve to) must be spawned through cmd.exe; since the CVE-2024-27980
+		// hardening, Node refuses to exec them directly and fails with ENOENT.
+		const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+
 		const child = spawn(command, args, {
+			shell,
 			cwd: this.#options.cwd,
 			env: this.#options.env ?? process.env,
 			stdio: ["pipe", "pipe", "pipe"],
