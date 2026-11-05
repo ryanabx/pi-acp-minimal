@@ -6,6 +6,7 @@ import {
 	type AuthenticateRequest,
 	type CancelNotification,
 	type ClientCapabilities,
+	type CloseSessionRequest,
 	type InitializeRequest,
 	type InitializeResponse,
 	type LoadSessionRequest,
@@ -17,6 +18,8 @@ import {
 	type PromptRequest,
 	type PromptResponse,
 	RequestError,
+	type ResumeSessionRequest,
+	type ResumeSessionResponse,
 	type SetSessionConfigOptionRequest,
 	type SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
@@ -69,6 +72,8 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))
 		.onRequest(methods.agent.session.new, ({ params }) => connected().newSession(params))
 		.onRequest(methods.agent.session.load, ({ params }) => connected().loadSession(params))
+		.onRequest(methods.agent.session.resume, ({ params }) => connected().resumeSession(params))
+		.onRequest(methods.agent.session.close, ({ params }) => connected().closeSession(params))
 		.onRequest(methods.agent.session.setConfigOption, ({ params }) => connected().setSessionConfigOption(params))
 		.onRequest(methods.agent.session.prompt, ({ params }) => connected().prompt(params))
 		.onNotification(methods.agent.session.cancel, ({ params }) => connected().cancel(params));
@@ -101,6 +106,7 @@ export class PiAcpAgent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { image: true, embeddedContext: true, audio: false },
+				sessionCapabilities: { resume: {}, close: {} },
 			},
 			// pi manages provider credentials itself (`pi auth login`), so there is
 			// nothing for the client to authenticate against.
@@ -122,13 +128,42 @@ export class PiAcpAgent {
 	}
 
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+		const session = await this.#openStoredSession(params);
+		// session/load streams history while the request is in flight: the client
+		// already knows this session id because it supplied it.
+		await session.replayHistory();
+		await session.publishCommands();
+		return { configOptions: session.configOptions() };
+	}
+
+	/** Like `session/load`, but the client already has the transcript: no replay. */
+	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+		const session = await this.#openStoredSession(params);
+		session.publishSessionStateSoon();
+		return { configOptions: session.configOptions() };
+	}
+
+	/** Cancel any running turn and stop the session's pi process. */
+	async closeSession(params: CloseSessionRequest): Promise<void> {
+		const session = this.#session(params.sessionId);
+		this.#sessions.delete(params.sessionId);
+		await session.close();
+	}
+
+	/** Start pi on a stored session file, replacing any live process for it. */
+	async #openStoredSession(params: {
+		sessionId: string;
+		cwd: string;
+		mcpServers?: unknown[] | undefined;
+	}): Promise<PiSession> {
 		this.#warnAboutMcpServers(params.mcpServers?.length ?? 0);
 		if (params.sessionId.startsWith(UNPERSISTED_SESSION_PREFIX)) {
-			throw invalidParams("This session was created without persistence and cannot be reloaded");
+			throw invalidParams("This session was created without persistence and cannot be reopened");
 		}
 
-		await this.#sessions.get(params.sessionId)?.stop();
+		const running = this.#sessions.get(params.sessionId);
 		this.#sessions.delete(params.sessionId);
+		await running?.close();
 
 		const session = await this.#startSession(params.cwd, params.sessionId);
 		if (session.sessionId !== params.sessionId) {
@@ -138,11 +173,7 @@ export class PiAcpAgent {
 			session.adoptSessionId(params.sessionId);
 			this.#sessions.set(params.sessionId, session);
 		}
-		// session/load streams history while the request is in flight: the client
-		// already knows this session id because it supplied it.
-		await session.replayHistory();
-		await session.publishCommands();
-		return { configOptions: session.configOptions() };
+		return session;
 	}
 
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
@@ -196,7 +227,7 @@ export class PiAcpAgent {
 	async shutdown(): Promise<void> {
 		const sessions = [...this.#sessions.values()];
 		this.#sessions.clear();
-		await Promise.all(sessions.map((session) => session.stop()));
+		await Promise.all(sessions.map((session) => session.close()));
 	}
 
 	async #startSession(cwd: string, resumeSessionFile?: string): Promise<PiSession> {

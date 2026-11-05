@@ -173,6 +173,21 @@ export class PiSession {
 	}
 
 	/**
+	 * Cancel any running turn, then stop pi.
+	 *
+	 * Once pi is gone no `agent_settled` can arrive, so a turn still waiting on
+	 * one ends here as cancelled rather than hanging its `session/prompt`.
+	 */
+	async close(): Promise<void> {
+		await this.cancel();
+		await this.stop();
+		this.#stopIdleWatchdog();
+		const turn = this.#turn;
+		this.#turn = null;
+		turn?.resolve("cancelled");
+	}
+
+	/**
 	 * Keep the client's session id authoritative after `session/load`.
 	 *
 	 * pi may resolve `--session <path>` to a slightly different file; the client

@@ -126,6 +126,8 @@ even where a mapping step has to await the file system.
 | `initialize` | — (capability negotiation only) |
 | `session/new` | spawn `pi --mode rpc` in `cwd`, then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
 | `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates |
+| `session/resume` | spawn `pi --mode rpc --session <file>`, no replay |
+| `session/close` | `abort` if a turn is running, then stop the pi process |
 | `session/prompt` | `prompt` |
 | `session/cancel` | `abort` |
 | `session/set_config_option` | `set_model` or `set_thinking_level` |

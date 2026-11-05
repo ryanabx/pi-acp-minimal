@@ -40,6 +40,8 @@ describe("initialize", () => {
 			expect(response.protocolVersion).toBe(PROTOCOL_VERSION);
 			expect(response.agentCapabilities?.loadSession).toBe(true);
 			expect(response.agentCapabilities?.promptCapabilities).toMatchObject({ image: true, embeddedContext: true });
+			expect(response.agentCapabilities?.sessionCapabilities).toMatchObject({ resume: {}, close: {} });
+			expect(response.agentInfo).toMatchObject({ name: "pi-acp-minimal" });
 		} finally {
 			done();
 		}
@@ -438,6 +440,54 @@ describe("usage reporting", () => {
 			.map((u) => (u.sessionUpdate === "usage_update" ? u.used : -1));
 		// Only the session-start report; the turn itself yielded nothing new.
 		expect(afterPrompt).toEqual([0]);
+	});
+});
+
+describe("session/resume", () => {
+	it("reopens a stored session without replaying it", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+
+		const before = client.updates.length;
+		const resumed = await client.request<{ configOptions: unknown[] }>("session/resume", {
+			sessionId,
+			cwd: workspace,
+			mcpServers: [],
+		});
+		expect(configOption(resumed.configOptions, "model").currentValue).toBe("anthropic/claude-sonnet-4");
+
+		// Commands still arrive, but none of the transcript does.
+		await client.waitFor((updates) =>
+			updates.slice(before).some((u) => u.sessionUpdate === "available_commands_update"),
+		);
+		const replayed = client.updates.slice(before);
+		expect(replayed.some((u) => u.sessionUpdate === "user_message_chunk")).toBe(false);
+		expect(replayed.some((u) => u.sessionUpdate === "agent_message_chunk")).toBe(false);
+
+		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT again" }] });
+		expect(response.stopReason).toBe("end_turn");
+	});
+});
+
+describe("session/close", () => {
+	it("stops the session so it no longer accepts prompts", async () => {
+		const { sessionId } = await newSession();
+		await client.request("session/close", { sessionId });
+		await expect(client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT" }] })).rejects.toMatchObject({
+			code: -32002,
+		});
+	});
+
+	it("ends a running turn as cancelled", async () => {
+		const { sessionId } = await newSession();
+		const pending = client.prompt({ sessionId, prompt: [{ type: "text", text: "SLOW please" }] });
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "agent_message_chunk"));
+		await client.request("session/close", { sessionId });
+		await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
+	});
+
+	it("rejects an unknown session", async () => {
+		await expect(client.request("session/close", { sessionId: "nope" })).rejects.toMatchObject({ code: -32002 });
 	});
 });
 
