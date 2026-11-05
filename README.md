@@ -97,20 +97,27 @@ skills and prompt templates load correctly for each session.
 src/
   cli.ts              entry point: stdio -> ACP agent app -> PiAcpAgent
   acp/
-    agent.ts          ACP `Agent`: initialize, session/{new,load,prompt,cancel,set_mode,set_model}
+    agent.ts          ACP agent app: initialize, session/{new,load,resume,list,delete,close,prompt,cancel,set_config_option}
     session.ts        one pi process + the RPC-event -> session/update mapping
     file-access.ts    reads files via the client's fs when available, else local disk
     errors.ts         JSON-RPC errors that carry a readable message
+    wire-trace.ts     --log-file: every ACP frame to a JSONL file
   pi/
     rpc-types.ts      structural mirror of pi's RPC protocol
     rpc-client.ts     spawn pi, JSONL framing, request/response correlation
+    session-store.ts  pi's stored sessions, for session/list and session/delete
     jsonl.ts          LF-only framing (pi's protocol forbids splitting on U+2028/9)
+    find-executable.ts  PATH lookup without a shell
   map/
     content.ts        ACP ContentBlock <-> pi message content
     tools.ts          pi tool name/args -> ACP kind, title, locations
-    models.ts         pi Model <-> ACP ModelInfo
-    modes.ts          pi thinking level <-> ACP session mode
+    models.ts         pi Model <-> ACP model id
+    config.ts         pi model + thinking level -> ACP session config options
     commands.ts       pi slash command -> ACP AvailableCommand
+    usage.ts          pi session stats -> ACP usage_update
+    mcp.ts            ACP McpServer -> pi MCP server config
+pi-extension/
+  acp-mcp-servers.js  loaded into pi to register client-supplied MCP servers
 ```
 
 All pi stdout traffic is funnelled through a serial queue in `PiSession`, so
@@ -300,6 +307,14 @@ once pi has stopped waiting for it.
 - **Authentication.** pi manages provider credentials (`pi auth login`), so no
   ACP auth methods are advertised and `authenticate` returns a pointer to that
   command.
+  `logout` is not offered either: pi has no logout command, and its credentials
+  are per provider, not one session the client could end.
+- **Additional workspace roots** (`additionalDirectories`) are not advertised:
+  pi runs each session in a single working directory.
+- **Session modes** (`session/set_mode`) are not offered: pi has no modes; its
+  model and thinking level are config options instead.
+- **Renaming from the client.** pi's session name is reported as the session
+  title, but stable ACP v1 has no request for the client to set it.
 - **`session/load` requires session persistence.** Sessions started with
   `--no-session` get a non-reloadable id.
 - **Session modes** (`session/set_mode`) are not used. pi has no operating
