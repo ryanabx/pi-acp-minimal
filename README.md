@@ -284,7 +284,7 @@ read in one sitting, and enforces it in CI.
 ```
 pi-acp-minimal
 └─┬ @agentclientprotocol/sdk@1.4.0   (the ACP protocol implementation)
-  └── zod@4.5.4                      (its schema validator, a peer dependency)
+  └── zod@4.6.7                      (its schema validator, a peer dependency)
 ```
 
 Neither declares an install lifecycle script, and both carry verified npm
