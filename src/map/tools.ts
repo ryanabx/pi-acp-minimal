@@ -20,6 +20,30 @@ export function isFileMutatingTool(toolName: string): boolean {
 	return toolName === "edit" || toolName === "write";
 }
 
+/** pi's built-in shell tools, whose output is a command's terminal output. */
+export function isShellTool(toolName: string): boolean {
+	return toolName === "bash" || toolName === "powershell";
+}
+
+/**
+ * What `next` adds to the output a client already shows as `previous`.
+ *
+ * pi reports a running command's output as cumulative snapshots, but a display
+ * terminal appends what it is sent. Once the output exceeds pi's limit the
+ * snapshot is only its tail: a suffix of the previous snapshot followed by the
+ * new text. Without any such overlap the whole snapshot is new.
+ */
+export function appendedOutput(previous: string, next: string): string {
+	if (next.startsWith(previous)) return next.slice(previous.length);
+	if (!next) return "";
+	const head = next.slice(0, 64);
+	for (let at = previous.indexOf(head); at >= 0; at = previous.indexOf(head, at + 1)) {
+		const overlap = previous.slice(at);
+		if (next.startsWith(overlap)) return next.slice(overlap.length);
+	}
+	return next;
+}
+
 export function toolKind(toolName: string): ToolKind {
 	const kind = TOOL_KINDS[toolName];
 	if (kind) return kind;
