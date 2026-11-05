@@ -98,6 +98,7 @@ const scenarios = [
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
 	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
+	{ match: /\bLEVELCHANGE\b/, run: levelChangeScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
@@ -290,6 +291,13 @@ async function selfAbortScenario() {
 	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
 	aborted = true;
 	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
+}
+
+/** An extension moves the thinking level mid-run, as pi 1.x reports it. */
+async function levelChangeScenario() {
+	state.thinkingLevel = "medium";
+	write({ type: "thinking_level_changed", level: "medium" });
+	await textScenario();
 }
 
 // ============================================================================

@@ -537,6 +537,12 @@ export class PiSession {
 				return this.#status(`Context compacted${detail}.`);
 			}
 
+			case "thinking_level_changed":
+				// pi's level can move without a prompt from us (an extension or a
+				// model switch can change it); re-read pi's state and let the client
+				// know now instead of at the next turn's end.
+				return this.publishConfigOptions();
+
 			case "auto_retry_start":
 				return this.#status(
 					`Retrying after error (attempt ${event.attempt}/${event.maxAttempts}, ` +

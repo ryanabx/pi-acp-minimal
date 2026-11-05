@@ -288,6 +288,26 @@ describe("session/set_config_option", () => {
 		expect(anthropic.description).toBe("anthropic · 99k context · reasoning");
 	});
 
+	it("updates the thinking control when pi changes the level mid-run", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "LEVELCHANGE please" }] });
+
+		const withMedium = client.updates.find((u) => {
+			if (u.sessionUpdate !== "config_option_update") return false;
+			try {
+				return configOption(u.configOptions, "thinking").currentValue === "medium";
+			} catch {
+				return false;
+			}
+		});
+		expect(withMedium).toBeDefined();
+
+		// The refresh arrives while the turn is running, not only at its end.
+		const updateIndex = client.updates.indexOf(withMedium!);
+		const firstTextIndex = client.updates.findIndex((u) => u.sessionUpdate === "agent_message_chunk");
+		expect(updateIndex).toBeLessThan(firstTextIndex);
+	});
+
 	it("does not re-announce config options that have not changed", async () => {
 		const { sessionId } = await newSession();
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
