@@ -95,6 +95,7 @@ const scenarios = [
 	{ match: /\bRETRY\b/, run: retryScenario },
 	{ match: /\bSLOW\b/, run: slowScenario },
 	{ match: /\bCONFIRM\b/, run: confirmScenario },
+	{ match: /\bNESTED\b/, run: nestedScenario },
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
 	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
@@ -255,6 +256,41 @@ async function confirmScenario() {
 	delta({ type: "text_delta", contentIndex: 0, delta: text });
 	delta({ type: "text_end", contentIndex: 0, content: text });
 	endAssistant([{ type: "text", text }], "stop");
+}
+
+/**
+ * A tool calls another tool through `ctx.executeTool()`, then asks for
+ * confirmation. pi tags the nested call's events with `parentToolCallId`.
+ */
+async function nestedScenario() {
+	const outerArgs = { command: "deploy" };
+	const innerArgs = { path: "config.json" };
+	startAssistant();
+	delta({ type: "toolcall_start", contentIndex: 0, id: "call-outer", toolName: "bash" });
+	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-outer", name: "bash", arguments: outerArgs } });
+	endAssistant([{ type: "toolCall", id: "call-outer", name: "bash", arguments: outerArgs }], "toolUse");
+	write({ type: "tool_execution_start", toolCallId: "call-outer", toolName: "bash", args: outerArgs });
+	write({ type: "tool_execution_start", toolCallId: "call-inner", toolName: "read", args: innerArgs, parentToolCallId: "call-outer" });
+	write({
+		type: "tool_execution_end",
+		toolCallId: "call-inner",
+		toolName: "read",
+		result: { content: [{ type: "text", text: "{}" }], details: {} },
+		isError: false,
+		durationMs: 1,
+		parentToolCallId: "call-outer",
+	});
+	write({ type: "extension_ui_request", id: "ui-3", method: "confirm", title: "Deploy?", message: "to production" });
+	await waitForUiResponse("ui-3");
+	write({
+		type: "tool_execution_end",
+		toolCallId: "call-outer",
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "deployed" }], details: {} },
+		isError: false,
+		durationMs: 5,
+	});
+	await textScenario();
 }
 
 async function notifyScenario() {

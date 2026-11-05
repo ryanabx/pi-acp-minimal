@@ -371,6 +371,18 @@ describe("extension UI bridge", () => {
 		expect(client.agentText()).toContain("declined");
 	});
 
+	it("attaches a dialog to the calling tool, not to a call it made", async () => {
+		const { sessionId } = await newSession();
+		client.permissionAnswer = "yes";
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "NESTED please" }] });
+
+		// The nested call is still visible as its own tool call...
+		expect(client.toolUpdates("call-inner").at(-1)).toMatchObject({ status: "completed" });
+		// ...but the confirm that follows it belongs to the outer tool.
+		expect(client.permissionRequests).toHaveLength(1);
+		expect(client.permissionRequests[0]!.toolCall.toolCallId).toBe("call-outer");
+	});
+
 	it("surfaces extension notifications as agent messages", async () => {
 		const { sessionId } = await newSession();
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "NOTIFY me" }] });

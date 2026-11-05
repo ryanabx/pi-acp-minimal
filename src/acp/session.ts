@@ -529,7 +529,7 @@ export class PiSession {
 				return this.#handleMessageEnd(event.message);
 
 			case "tool_execution_start":
-				return this.#handleToolStart(event.toolCallId, event.toolName, event.args);
+				return this.#handleToolStart(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
 
 			case "tool_execution_update":
 				return this.#handleToolUpdate(event.toolCallId, event.partialResult);
@@ -694,8 +694,16 @@ export class PiSession {
 		});
 	}
 
-	async #handleToolStart(toolCallId: string, toolName: string, args: Record<string, unknown>): Promise<void> {
-		this.#activeToolCallId = toolCallId;
+	async #handleToolStart(
+		toolCallId: string,
+		toolName: string,
+		args: Record<string, unknown>,
+		parentToolCallId: string | undefined,
+	): Promise<void> {
+		// A call a tool makes through `ctx.executeTool()` still shows as its own
+		// tool call, but the calling tool stays the one a dialog belongs to:
+		// otherwise the nested call's end would leave no active tool call behind.
+		if (!parentToolCallId) this.#activeToolCallId = toolCallId;
 		await this.#describeToolCall(toolCallId, toolName, args, "in_progress");
 
 		// Snapshot the file before it changes so the completion can carry a real diff.
