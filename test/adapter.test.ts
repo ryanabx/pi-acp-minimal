@@ -434,6 +434,9 @@ describe("usage reporting", () => {
 
 	it("stays quiet when pi has no context figure to report", async () => {
 		const { sessionId } = await newSession();
+		// The session-start report follows the session/new response; let it land
+		// before the scenario stops pi from reporting a figure.
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "usage_update"));
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "NOSTATS please" }] });
 		const afterPrompt = client.updates
 			.filter((u) => u.sessionUpdate === "usage_update")
@@ -643,6 +646,8 @@ describe("session titles", () => {
 		try {
 			await named.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
 			const { sessionId } = await named.newSession({ cwd: dir, mcpServers: [] });
+			// Nothing about the session may reach the client before the response does.
+			expect(named.updates).toEqual([]);
 			await named.waitFor((updates) => titles(updates).length > 0);
 			expect(titles(named.updates)).toEqual(["My chat"]);
 

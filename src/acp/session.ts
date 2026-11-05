@@ -351,13 +351,16 @@ export class PiSession {
 	// ==========================================================================
 
 	/**
-	 * Publish commands and usage once the caller's own response has been sent.
+	 * Publish the title, commands and usage once the caller's own response has been sent.
 	 *
 	 * Used by `session/new`, where notifying before the response would reference a
-	 * session the client has not registered yet.
+	 * session the client has not registered yet. The SDK queues a response for
+	 * writing only after the handler's promise settles, several microtasks later,
+	 * so a microtask is too early; the next macrotask runs after the response is
+	 * queued, and the SDK writes frames in the order they were queued.
 	 */
 	publishSessionStateSoon(): void {
-		queueMicrotask(() => {
+		setImmediate(() => {
 			void (async () => {
 				await this.publishSessionInfo();
 				await this.publishCommands();
