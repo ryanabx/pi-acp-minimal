@@ -130,6 +130,37 @@ describe("session/prompt", () => {
 		const { sessionId } = await newSession();
 		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "/NOOP" }] });
 		expect(response.stopReason).toBe("end_turn");
+		// pi reports the prompt "handled", which ends the turn without waiting
+		// for the idle watchdog.
+		const log = client.stderr.join("");
+		expect(log).toContain('pi reported the prompt "handled"');
+		expect(log).not.toContain("prompt completed without an agent run");
+	});
+
+	describe("with a pi that reports no prompt disposition", () => {
+		let old: TestClient;
+		let oldSession: string;
+		let oldDone: () => void;
+
+		beforeEach(async () => {
+			const created = createTestClient({ env: { MOCK_PI_NO_DISPOSITION: "1" } });
+			({ client: old, cleanup: oldDone } = created);
+			await old.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			({ sessionId: oldSession } = await old.newSession({ cwd: created.workspace, mcpServers: [] }));
+		});
+		afterEach(() => oldDone());
+
+		it("still runs prompts", async () => {
+			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "TEXT please" }] });
+			expect(response.stopReason).toBe("end_turn");
+			expect(old.agentText()).toContain("Hello, world!");
+		});
+
+		it("falls back to the idle watchdog for extension commands", async () => {
+			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "/NOOP" }] });
+			expect(response.stopReason).toBe("end_turn");
+			expect(old.stderr.join("")).toContain('prompt completed without an agent run (pi reported "unknown")');
+		});
 	});
 });
 

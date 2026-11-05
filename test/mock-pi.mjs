@@ -113,6 +113,8 @@ function startAssistant() {
 
 /** pi 1.x reports a per-input disposition on the prompt response. */
 function promptDisposition(message) {
+	// MOCK_PI_NO_DISPOSITION mimics an older pi that sends no response data.
+	if (process.env.MOCK_PI_NO_DISPOSITION === "1") return undefined;
 	// The NOOP scenario is an extension command that consumes the prompt inline.
 	return { disposition: /\bNOOP\b/.test(message) ? "handled" : "started" };
 }

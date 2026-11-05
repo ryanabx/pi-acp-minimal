@@ -24,6 +24,7 @@ import type {
 	PiImageContent,
 	PiMessage,
 	PiModel,
+	PiPromptDisposition,
 	PiRpcEvent,
 	PiSessionState,
 	PiStopReason,
@@ -108,6 +109,8 @@ export class PiSession {
 	#turn: { resolve: (reason: PromptStopReason) => void; reject: (error: Error) => void } | null = null;
 	#cancelled = false;
 	#sawAgentRun = false;
+	/** What pi reported it did with the current prompt, if anything yet. */
+	#promptDisposition: PiPromptDisposition | undefined;
 	#idleWatchdog: NodeJS.Timeout | null = null;
 	#idleObservations = 0;
 	#lastStopReason: PiStopReason | undefined;
@@ -347,6 +350,7 @@ export class PiSession {
 
 		this.#cancelled = false;
 		this.#sawAgentRun = false;
+		this.#promptDisposition = undefined;
 		this.#lastStopReason = undefined;
 		this.#lastErrorMessage = undefined;
 		this.#toolCalls.clear();
@@ -357,13 +361,29 @@ export class PiSession {
 		});
 
 		try {
-			await this.#client.request({ type: "prompt", message, images: images.length > 0 ? images : undefined });
+			const response = await this.#client.request({
+				type: "prompt",
+				message,
+				images: images.length > 0 ? images : undefined,
+			});
+			// Older pi builds send no `data` on the prompt response.
+			this.#promptDisposition = response?.disposition;
 		} catch (error) {
 			this.#turn = null;
 			throw internalError(errorMessage(error));
 		}
 
-		this.#startIdleWatchdog();
+		if (this.#promptDisposition === "handled" && !this.#sawAgentRun) {
+			// An extension command or input handler consumed the prompt: pi will
+			// not start a run for it, so there is no agent_settled to wait for.
+			// Queue behind events pi already sent so their updates land first.
+			this.#log('pi reported the prompt "handled" without an agent run; ending turn');
+			this.#enqueue(() => this.#settleTurn());
+		} else {
+			// "started" and "queued" end on agent_settled. The watchdog covers pi
+			// builds that do not report a disposition.
+			this.#startIdleWatchdog();
+		}
 		const stopReason = await settled;
 		await this.publishCommands();
 		await this.publishConfigOptions();
@@ -725,8 +745,11 @@ export class PiSession {
 	 *
 	 * Extension commands (`/mycommand`) are handled inline by pi and may finish
 	 * without emitting `agent_start`/`agent_settled`, which would leave
-	 * `session/prompt` pending forever. Poll pi until it has been idle for a
-	 * few consecutive checks, then end the turn ourselves.
+	 * `session/prompt` pending forever. pi reports these as a `"handled"`
+	 * disposition, which ends the turn directly; this is the fallback for pi
+	 * builds that report no disposition and for a reported run that never
+	 * materialises. Poll pi until it has been idle for a few consecutive
+	 * checks, then end the turn ourselves.
 	 */
 	#startIdleWatchdog(): void {
 		this.#stopIdleWatchdog();
@@ -759,7 +782,9 @@ export class PiSession {
 		if (++this.#idleObservations < IDLE_OBSERVATIONS_BEFORE_SETTLE) return;
 
 		this.#stopIdleWatchdog();
-		this.#log("prompt completed without an agent run (extension command); ending turn");
+		this.#log(
+			`prompt completed without an agent run (pi reported "${this.#promptDisposition ?? "unknown"}"); ending turn`,
+		);
 		this.#enqueue(() => this.#settleTurn());
 	}
 
