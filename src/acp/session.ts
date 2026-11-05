@@ -1,16 +1,17 @@
-import type {
-	AgentSideConnection,
-	AvailableCommand,
-	ClientCapabilities,
-	ContentBlock,
-	PermissionOption,
-	SessionConfigOption,
-	PromptResponse,
-	SessionNotification,
-	ToolCallContent,
-	ToolCallLocation,
-	ToolCallStatus,
-	ToolKind,
+import {
+	type AgentContext,
+	type AvailableCommand,
+	type ClientCapabilities,
+	type ContentBlock,
+	methods,
+	type PermissionOption,
+	type PromptResponse,
+	type SessionConfigOption,
+	type SessionNotification,
+	type ToolCallContent,
+	type ToolCallLocation,
+	type ToolCallStatus,
+	type ToolKind,
 } from "@agentclientprotocol/sdk";
 import { toAcpCommand } from "../map/commands.js";
 import { assistantText, toAcpContentBlocks } from "../map/content.js";
@@ -38,7 +39,8 @@ import { FileAccess } from "./file-access.js";
 type PromptStopReason = PromptResponse["stopReason"];
 
 export interface PiSessionOptions {
-	connection: AgentSideConnection;
+	/** Calls back into the ACP client for the lifetime of the connection. */
+	client: AgentContext;
 	clientCapabilities: ClientCapabilities | undefined;
 	cwd: string;
 	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
@@ -95,7 +97,7 @@ export class PiSession {
 	readonly cwd: string;
 	sessionId!: string;
 
-	#connection: AgentSideConnection;
+	#acp: AgentContext;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#client: PiRpcClient;
 	#files!: FileAccess;
@@ -128,7 +130,7 @@ export class PiSession {
 
 	constructor(options: PiSessionOptions) {
 		this.cwd = options.cwd;
-		this.#connection = options.connection;
+		this.#acp = options.client;
 		this.#clientCapabilities = options.clientCapabilities;
 		this.#log = options.log;
 
@@ -158,7 +160,7 @@ export class PiSession {
 		const state = await this.#client.request({ type: "get_state" });
 		// The session file doubles as the ACP session id so `session/load` can resume it.
 		this.sessionId = state.sessionFile ?? `${UNPERSISTED_SESSION_PREFIX}${state.sessionId}`;
-		this.#files = new FileAccess(this.#connection, this.#clientCapabilities, () => this.sessionId);
+		this.#files = new FileAccess(this.#acp, this.#clientCapabilities, () => this.sessionId);
 
 		await this.refreshModelState(state);
 		await this.refreshThinkingState(state);
@@ -908,8 +910,8 @@ export class PiSession {
 
 		// Not awaited: pi is blocked on this dialog, and holding the event queue
 		// would stall any tool output still streaming alongside it.
-		void this.#connection
-			.requestPermission({
+		void this.#acp
+			.request(methods.client.session.requestPermission, {
 				sessionId: this.sessionId,
 				options,
 				toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
@@ -950,7 +952,7 @@ export class PiSession {
 	}
 
 	async #notify(update: SessionNotification["update"]): Promise<void> {
-		await this.#connection.sessionUpdate({ sessionId: this.sessionId, update });
+		await this.#acp.notify(methods.client.session.update, { sessionId: this.sessionId, update });
 	}
 }
 

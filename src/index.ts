@@ -1,4 +1,4 @@
-export { PiAcpAgent, type PiAcpAgentOptions } from "./acp/agent.js";
+export { createPiAgentApp, PiAcpAgent, type PiAcpAgentOptions } from "./acp/agent.js";
 export { PiSession, type PiSessionOptions } from "./acp/session.js";
 export { PiRpcClient, PiRpcError, type PiRpcClientOptions } from "./pi/rpc-client.js";
 export * from "./pi/rpc-types.js";

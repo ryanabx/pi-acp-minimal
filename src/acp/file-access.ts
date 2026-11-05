@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import type { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
+import { type AgentContext, type ClientCapabilities, methods } from "@agentclientprotocol/sdk";
 
 /**
  * Reads text files on behalf of the adapter, preferring the client's file
@@ -10,7 +10,7 @@ import type { AgentSideConnection, ClientCapabilities } from "@agentclientprotoc
  */
 export class FileAccess {
 	constructor(
-		private readonly connection: AgentSideConnection,
+		private readonly client: AgentContext,
 		private readonly capabilities: ClientCapabilities | undefined,
 		/** Read lazily: `session/load` can rename the session after construction. */
 		private readonly sessionId: () => string,
@@ -20,7 +20,10 @@ export class FileAccess {
 	async readText(absolutePath: string): Promise<string | null> {
 		if (this.capabilities?.fs?.readTextFile) {
 			try {
-				const response = await this.connection.readTextFile({ sessionId: this.sessionId(), path: absolutePath });
+				const response = await this.client.request(methods.client.fs.readTextFile, {
+					sessionId: this.sessionId(),
+					path: absolutePath,
+				});
 				return response.content;
 			} catch {
 				// Client refused or does not know the file; fall through to local disk.

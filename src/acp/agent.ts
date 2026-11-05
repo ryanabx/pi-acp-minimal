@@ -1,21 +1,25 @@
-import type {
-	Agent,
-	AgentSideConnection,
-	AuthenticateRequest,
-	CancelNotification,
-	ClientCapabilities,
-	InitializeRequest,
-	InitializeResponse,
-	LoadSessionRequest,
-	LoadSessionResponse,
-	NewSessionRequest,
-	NewSessionResponse,
-	PromptRequest,
-	PromptResponse,
-	SetSessionConfigOptionRequest,
-	SetSessionConfigOptionResponse,
+import { readFileSync } from "node:fs";
+import {
+	type AgentApp,
+	type AgentContext,
+	agent as agentApp,
+	type AuthenticateRequest,
+	type CancelNotification,
+	type ClientCapabilities,
+	type InitializeRequest,
+	type InitializeResponse,
+	type LoadSessionRequest,
+	type LoadSessionResponse,
+	methods,
+	type NewSessionRequest,
+	type NewSessionResponse,
+	PROTOCOL_VERSION,
+	type PromptRequest,
+	type PromptResponse,
+	RequestError,
+	type SetSessionConfigOptionRequest,
+	type SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
-import { PROTOCOL_VERSION, RequestError } from "@agentclientprotocol/sdk";
 import { isThinkingLevel, MODEL_CONFIG_ID, THINKING_CONFIG_ID } from "../map/config.js";
 import { toPiPrompt } from "../map/content.js";
 import { PiRpcError } from "../pi/rpc-client.js";
@@ -31,20 +35,61 @@ export interface PiAcpAgentOptions {
 	log: (message: string) => void;
 }
 
+/** This package's own name and version, reported to the client as `agentInfo`. */
+const PACKAGE: { name: string; version: string } = JSON.parse(
+	readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+);
+
+/**
+ * An ACP agent app that serves pi over one connection, plus a hook to stop
+ * every pi process it started.
+ *
+ * Over stdio there is exactly one connection. A server that accepts several
+ * should build one app per connection (for example from a `createAgent`
+ * factory): the app owns that connection's sessions. Every method the adapter
+ * supports is registered explicitly, so the SDK answers anything else with
+ * Method Not Found.
+ */
+export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; shutdown: () => Promise<void> } {
+	let agent: PiAcpAgent | undefined;
+	const connected = (): PiAcpAgent => {
+		if (!agent) throw internalError("ACP connection is not set up");
+		return agent;
+	};
+
+	const app = agentApp({ name: PACKAGE.name })
+		.onConnect((connection) => {
+			// onConnect runs before the connection handles its first message.
+			if (agent) throw new Error("createPiAgentApp serves a single connection; build one app per connection");
+			const current = new PiAcpAgent(connection.client, options);
+			agent = current;
+			void connection.closed.then(() => current.shutdown());
+		})
+		.onRequest(methods.agent.initialize, ({ params }) => connected().initialize(params))
+		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))
+		.onRequest(methods.agent.session.new, ({ params }) => connected().newSession(params))
+		.onRequest(methods.agent.session.load, ({ params }) => connected().loadSession(params))
+		.onRequest(methods.agent.session.setConfigOption, ({ params }) => connected().setSessionConfigOption(params))
+		.onRequest(methods.agent.session.prompt, ({ params }) => connected().prompt(params))
+		.onNotification(methods.agent.session.cancel, ({ params }) => connected().cancel(params));
+
+	return { app, shutdown: async () => agent?.shutdown() };
+}
+
 /**
  * ACP agent backed by `pi --mode rpc`.
  *
  * Each ACP session owns one pi child process rooted at the session's cwd, which
  * is also how per-session working directories, settings and extensions are honoured.
  */
-export class PiAcpAgent implements Agent {
-	#connection: AgentSideConnection;
+export class PiAcpAgent {
+	#client: AgentContext;
 	#options: PiAcpAgentOptions;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#sessions = new Map<string, PiSession>();
 
-	constructor(connection: AgentSideConnection, options: PiAcpAgentOptions) {
-		this.#connection = connection;
+	constructor(client: AgentContext, options: PiAcpAgentOptions) {
+		this.#client = client;
 		this.#options = options;
 	}
 
@@ -52,6 +97,7 @@ export class PiAcpAgent implements Agent {
 		this.#clientCapabilities = params.clientCapabilities;
 		return {
 			protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
+			agentInfo: { name: PACKAGE.name, title: "pi", version: PACKAGE.version },
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { image: true, embeddedContext: true, audio: false },
@@ -155,7 +201,7 @@ export class PiAcpAgent implements Agent {
 
 	async #startSession(cwd: string, resumeSessionFile?: string): Promise<PiSession> {
 		const session = new PiSession({
-			connection: this.#connection,
+			client: this.#client,
 			clientCapabilities: this.#clientCapabilities,
 			cwd,
 			piCommand: this.#options.piCommand,

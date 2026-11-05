@@ -95,7 +95,7 @@ skills and prompt templates load correctly for each session.
 
 ```
 src/
-  cli.ts              entry point: stdio -> AgentSideConnection -> PiAcpAgent
+  cli.ts              entry point: stdio -> ACP agent app -> PiAcpAgent
   acp/
     agent.ts          ACP `Agent`: initialize, session/{new,load,prompt,cancel,set_mode,set_model}
     session.ts        one pi process + the RPC-event -> session/update mapping
@@ -283,7 +283,7 @@ read in one sitting, and enforces it in CI.
 
 ```
 pi-acp-minimal
-└─┬ @agentclientprotocol/sdk@1.4.0   (the ACP protocol implementation)
+└─┬ @agentclientprotocol/sdk@2.4.0   (the ACP protocol implementation)
   └── zod@4.6.7                      (its schema validator, a peer dependency)
 ```
 
@@ -304,7 +304,7 @@ The policy:
 - **`npm-shrinkwrap.json` is the committed lockfile**, not `package-lock.json`.
   npm honours a shrinkwrap when this package is installed as a dependency, so
   installing from git resolves the exact same versions and integrity hashes
-  recorded here. Without it, the SDK's `zod` peer range (`^3.25.0 || ^4.0.0`)
+  recorded here. Without it, the SDK's `zod` peer range (`^3.25.76 || ^4.0.0`)
   would resolve to whatever is newest at install time.
 - **CI installs with `npm ci --ignore-scripts`** and fails on any advisory
   affecting runtime dependencies. Dev-only advisories are reported without
@@ -366,7 +366,12 @@ enough to assert on.
 
 ### A note on the ACP TypeScript SDK
 
-This uses `@agentclientprotocol/sdk`, the current official TypeScript SDK.
+This uses `@agentclientprotocol/sdk`, the current official TypeScript SDK, through
+its default entrypoint: stable ACP protocol v1. SDK 2.x versions its API
+separately from the protocol; its draft protocol v2 lives under
+`@agentclientprotocol/sdk/experimental/v2` and can change incompatibly in any
+release, and its `/unstable` entrypoints add v1 features that are not yet
+stable. The adapter uses neither.
 
 Beware of `@zed-industries/agent-client-protocol`: it is the *old* package name,
 its newest release (0.4.5) is far behind the protocol Zed actually speaks, and

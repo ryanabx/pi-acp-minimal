@@ -34,7 +34,7 @@
 		"vitest": "3.2.7"
 	},
 	"dependencies": {
-		"@agentclientprotocol/sdk": "1.4.0"
+		"@agentclientprotocol/sdk": "2.4.0"
 	},
 	"repository": {
 		"type": "git",
