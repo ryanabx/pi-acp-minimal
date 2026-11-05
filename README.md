@@ -158,7 +158,7 @@ deletes pi session files inside that store.
 | `tool_execution_update` | `tool_call_update` with the accumulated output |
 | `tool_execution_end` | `tool_call_update` (status `completed`/`failed`), diff or text content, `rawOutput` |
 | `agent_settled` | resolves `session/prompt` |
-| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `extension_error` | italic `agent_message_chunk` status lines |
+| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `extension_error`, extension `notify` | `notice` when the client advertises `session.notices`, else italic `agent_message_chunk` status lines |
 | `session_info_changed`, and `get_state.sessionName` when a session opens | `session_info_update` with the name as `title` (`null` when cleared) |
 | `get_commands` (polled after each turn) | `available_commands_update` |
 | `get_session_stats` (polled per turn) | `usage_update` |

@@ -586,7 +586,9 @@ export class PiSession {
 
 			case "compaction_end": {
 				if (event.aborted) return this.#status("Compaction aborted.");
-				if (!event.result) return this.#status(`Compaction failed: ${event.errorMessage ?? "unknown error"}`);
+				if (!event.result) {
+					return this.#status("Compaction failed", { level: "error", description: event.errorMessage ?? "unknown error" });
+				}
 				const before = event.result.tokensBefore;
 				const after = event.result.estimatedTokensAfter;
 				const detail = before && after ? ` (~${before} → ~${after} tokens)` : "";
@@ -601,18 +603,22 @@ export class PiSession {
 
 			case "auto_retry_start":
 				return this.#status(
-					`Retrying after error (attempt ${event.attempt}/${event.maxAttempts}, ` +
-						`waiting ${Math.round(event.delayMs / 1000)}s): ${event.errorMessage}`,
+					`Retrying after error (attempt ${event.attempt}/${event.maxAttempts}, waiting ${Math.round(event.delayMs / 1000)}s)`,
+					{ level: "warning", description: event.errorMessage },
 				);
 
 			case "auto_retry_end":
 				if (event.success) return this.#status(`Retry succeeded on attempt ${event.attempt}.`);
-				return this.#status(`Retries exhausted after ${event.attempt} attempts: ${event.finalError ?? "unknown error"}`);
+				return this.#status(`Retries exhausted after ${event.attempt} attempts`, {
+					level: "error",
+					description: event.finalError ?? "unknown error",
+				});
 
 			case "summarization_retry_scheduled":
-				return this.#status(
-					`Retrying summarization (attempt ${event.attempt}/${event.maxAttempts}): ${event.errorMessage}`,
-				);
+				return this.#status(`Retrying summarization (attempt ${event.attempt}/${event.maxAttempts})`, {
+					level: "warning",
+					description: event.errorMessage,
+				});
 
 			case "session_info_changed":
 				// /name, --name, or an extension's pi.setSessionName(); absent clears it.
@@ -621,7 +627,7 @@ export class PiSession {
 
 			case "extension_error":
 				this.#log(`extension error in ${event.extensionPath} (${event.event}): ${event.error}`);
-				return this.#status(`Extension error (${event.event}): ${event.error}`);
+				return this.#status(`Extension error (${event.event})`, { level: "error", description: event.error });
 
 			default:
 				// agent_end, turn_start, queue_update and the remaining retry events
@@ -870,7 +876,7 @@ export class PiSession {
 	async #handleExtensionUi(request: PiExtensionUiRequest): Promise<void> {
 		switch (request.method) {
 			case "notify":
-				return this.#status(request.message, request.notifyType);
+				return this.#status(request.message, { level: request.notifyType });
 
 			case "confirm":
 				return this.#askPermission(
@@ -907,10 +913,10 @@ export class PiSession {
 				// ACP has no free-text prompt; decline so the extension takes its
 				// cancellation path instead of blocking pi forever.
 				this.#client.respondExtensionUi({ type: "extension_ui_response", id: request.id, cancelled: true });
-				return this.#status(
-					`A pi extension asked for text input ("${request.title}"), which ACP cannot display. The request was cancelled.`,
-					"warning",
-				);
+				return this.#status(`A pi extension asked for text input ("${request.title}")`, {
+					level: "warning",
+					description: "ACP cannot display it here, so the request was cancelled.",
+				});
 
 			default:
 				// setStatus / setWidget / setTitle / set_editor_text are TUI chrome.
@@ -981,12 +987,38 @@ export class PiSession {
 	// Notification helpers
 	// ==========================================================================
 
-	/** Out-of-band progress text, rendered as an italic agent message line. */
-	async #status(message: string, level: "info" | "warning" | "error" = "info"): Promise<void> {
-		const prefix = level === "error" ? "⚠ " : level === "warning" ? "⚠ " : "";
+	/**
+	 * Out-of-band information for the user: retries, extension messages and the like.
+	 *
+	 * Sent as an ACP `notice` when the client advertises `session.notices`;
+	 * otherwise as an italic agent message line, which is the fallback the
+	 * protocol suggests. A multi-line title keeps its first line as the title
+	 * and moves the rest into the description.
+	 */
+	async #status(
+		title: string,
+		{ level = "info", description }: { level?: "info" | "warning" | "error"; description?: string } = {},
+	): Promise<void> {
+		const [first = "", ...rest] = title.trim().split(/\n+/);
+		const detail = [rest.join(" ").trim(), description?.trim()].filter(Boolean).join(" ") || undefined;
+		const heading = first.trim() || detail;
+		if (!heading) return;
+
+		if (this.#clientCapabilities?.session?.notices) {
+			await this.#notify({
+				sessionUpdate: "notice",
+				severity: level,
+				title: heading,
+				...(detail && heading !== detail ? { description: detail } : {}),
+			});
+			return;
+		}
+
+		const prefix = level === "info" ? "" : "⚠ ";
+		const text = detail && heading !== detail ? `${heading}: ${detail}` : heading;
 		await this.#notify({
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `\n_${prefix}${message.replace(/\n+/g, " ")}_\n` },
+			content: { type: "text", text: `\n_${prefix}${text.replace(/\n+/g, " ")}_\n` },
 		});
 	}
 

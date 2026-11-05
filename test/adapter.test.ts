@@ -443,6 +443,48 @@ describe("usage reporting", () => {
 	});
 });
 
+/** A second client that advertises extra capabilities; the caller runs `done`. */
+async function clientWith(clientCapabilities: Record<string, unknown>) {
+	const created = createTestClient();
+	await created.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities });
+	const { sessionId } = await created.client.newSession({ cwd: created.workspace, mcpServers: [] });
+	return { client: created.client, sessionId, done: created.cleanup };
+}
+
+describe("notices", () => {
+	it("sends pi's status messages as notices to a client that supports them", async () => {
+		const { client: noticing, sessionId, done } = await clientWith({ session: { notices: {} } });
+		try {
+			await noticing.prompt({ sessionId, prompt: [{ type: "text", text: "NOTIFY me" }] });
+			await noticing.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
+
+			const notices = noticing.updates.filter((u) => u.sessionUpdate === "notice");
+			expect(notices).toEqual([
+				{ sessionUpdate: "notice", severity: "warning", title: "heads up" },
+				{
+					sessionUpdate: "notice",
+					severity: "warning",
+					title: "Retrying after error (attempt 1/3, waiting 2s)",
+					description: "Overloaded",
+				},
+				{ sessionUpdate: "notice", severity: "info", title: "Retry succeeded on attempt 2." },
+			]);
+			// Notices replace the italic status lines rather than doubling them.
+			expect(noticing.agentText()).not.toContain("heads up");
+			expect(noticing.agentText()).not.toContain("Retrying");
+		} finally {
+			done();
+		}
+	});
+
+	it("falls back to status lines in the agent message otherwise", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
+		expect(client.updates.some((u) => u.sessionUpdate === "notice")).toBe(false);
+		expect(client.agentText()).toContain("_⚠ Retrying after error (attempt 1/3, waiting 2s): Overloaded_");
+	});
+});
+
 describe("session titles", () => {
 	const titles = (updates: typeof client.updates) =>
 		updates.flatMap((u) => (u.sessionUpdate === "session_info_update" ? [u.title] : []));
