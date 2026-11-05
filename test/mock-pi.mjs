@@ -97,6 +97,10 @@ const scenarios = [
 	{ match: /\bRETRY\b/, run: retryScenario },
 	{ match: /\bSLOW\b/, run: slowScenario },
 	{ match: /\bCONFIRM\b/, run: confirmScenario },
+	{ match: /\bSELECTSLOW\b/, run: () => dialogScenario({ method: "select", title: "Pick fast", options: ["a", "b"], timeout: 300 }) },
+	{ match: /\bSELECT\b/, run: () => dialogScenario({ method: "select", title: "Pick a colour", options: ["red", "green"] }) },
+	{ match: /\bINPUT\b/, run: () => dialogScenario({ method: "input", title: "Your name?", placeholder: "Ada" }) },
+	{ match: /\bEDITOR\b/, run: () => dialogScenario({ method: "editor", title: "Edit notes", prefill: "line 1\nline 2" }) },
 	{ match: /\bNESTED\b/, run: nestedScenario },
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
@@ -251,6 +255,27 @@ async function slowScenario() {
 		await sleep(20);
 	}
 	endAssistant([{ type: "text", text: "." }], aborted ? "aborted" : "stop");
+}
+
+let dialogCount = 0;
+
+/**
+ * An extension dialog whose answer the assistant echoes back.
+ *
+ * Like pi, a dialog with a `timeout` resolves to "no answer" by itself once
+ * it expires, whatever the client does later.
+ */
+async function dialogScenario(request) {
+	const id = `dialog-${++dialogCount}`;
+	write({ type: "extension_ui_request", id, ...request });
+	const answer = await (request.timeout
+		? Promise.race([waitForUiResponse(id), sleep(request.timeout).then(() => ({ timedOut: true }))])
+		: waitForUiResponse(id));
+	const text = answer.timedOut ? "timed out" : answer.cancelled ? "cancelled" : `answer: ${answer.value}`;
+	startAssistant();
+	delta({ type: "text_start", contentIndex: 0 });
+	delta({ type: "text_delta", contentIndex: 0, delta: text });
+	endAssistant([{ type: "text", text }], "stop");
 }
 
 async function confirmScenario() {

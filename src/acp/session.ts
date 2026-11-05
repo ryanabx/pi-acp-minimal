@@ -3,7 +3,9 @@ import {
 	type AvailableCommand,
 	type ClientCapabilities,
 	type ContentBlock,
+	type ElicitationPropertySchema,
 	methods,
+	type SendRequestOptions,
 	type PermissionOption,
 	type PromptResponse,
 	type SessionConfigOption,
@@ -912,9 +914,18 @@ export class PiSession {
 					],
 					(optionId) => ({ type: "extension_ui_response", id: request.id, confirmed: optionId === "yes" }),
 					{ type: "extension_ui_response", id: request.id, confirmed: false },
+					request.timeout,
 				);
 
 			case "select":
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						oneOf: request.options.map((option) => ({ const: option, title: option })),
+					}, request.timeout);
+				}
+				// Without elicitation, a choice is rendered as a permission prompt
+				// whose options are pi's choices.
 				return this.#askPermission(
 					request.id,
 					request.title,
@@ -930,23 +941,87 @@ export class PiSession {
 							: { type: "extension_ui_response", id: request.id, value };
 					},
 					{ type: "extension_ui_response", id: request.id, cancelled: true },
+					request.timeout,
 				);
 
 			case "input":
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						...(request.placeholder ? { description: request.placeholder } : {}),
+					}, request.timeout);
+				}
+				return this.#declineTextInput(request.id, request.title);
+
 			case "editor":
-				// ACP has no free-text prompt; decline so the extension takes its
-				// cancellation path instead of blocking pi forever.
-				this.#client.respondExtensionUi({ type: "extension_ui_response", id: request.id, cancelled: true });
-				return this.#status(`A pi extension asked for text input ("${request.title}")`, {
-					level: "warning",
-					description: "ACP cannot display it here, so the request was cancelled.",
-				});
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						...(request.prefill ? { default: request.prefill } : {}),
+					});
+				}
+				return this.#declineTextInput(request.id, request.title);
 
 			default:
 				// setStatus / setWidget / setTitle / set_editor_text are TUI chrome.
 				this.#log(`ignoring extension UI request: ${request.method}`);
 				return;
 		}
+	}
+
+	/** Whether the client renders form elicitations (`elicitation.form`). */
+	get #supportsFormElicitation(): boolean {
+		return this.#clientCapabilities?.elicitation?.form != null;
+	}
+
+	/**
+	 * Ask the user for one value through an ACP form elicitation, and hand it to pi.
+	 *
+	 * The form has a single required field. It is tied to the running tool
+	 * call, if any, like the permission prompts. When pi gives the dialog a
+	 * timeout, the elicitation is withdrawn once pi has stopped waiting.
+	 */
+	async #elicitText(piRequestId: string, message: string, field: ElicitationPropertySchema, timeout?: number): Promise<void> {
+		const toolCallId = this.#activeToolCallId;
+		// Not awaited: pi is blocked on this dialog, and holding the event queue
+		// would stall any tool output still streaming alongside it.
+		void this.#acp
+			.request(
+				methods.client.elicitation.create,
+				{
+					mode: "form",
+					sessionId: this.sessionId,
+					...(toolCallId ? { toolCallId } : {}),
+					message,
+					requestedSchema: { type: "object", properties: { value: field }, required: ["value"] },
+				},
+				withTimeout(timeout),
+			)
+			.then(
+				(response) => {
+					const value = response.action === "accept" && isPlainObject(response.content) ? response.content.value : undefined;
+					this.#client.respondExtensionUi(
+						typeof value === "string"
+							? { type: "extension_ui_response", id: piRequestId, value }
+							: { type: "extension_ui_response", id: piRequestId, cancelled: true },
+					);
+				},
+				(error: unknown) => {
+					this.#log(`elicitation failed: ${errorMessage(error)}`);
+					this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
+				},
+			);
+	}
+
+	/** Without elicitation there is no free-text prompt: cancel, and say why. */
+	async #declineTextInput(piRequestId: string, title: string): Promise<void> {
+		// Decline so the extension takes its cancellation path instead of
+		// blocking pi forever.
+		this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
+		return this.#status(`A pi extension asked for text input ("${title}")`, {
+			level: "warning",
+			description: "This client cannot show text prompts (no form elicitation), so the request was cancelled.",
+		});
 	}
 
 	/**
@@ -961,6 +1036,8 @@ export class PiSession {
 		options: PermissionOption[],
 		toResponse: (optionId: string) => Parameters<PiRpcClient["respondExtensionUi"]>[0],
 		onCancel: Parameters<PiRpcClient["respondExtensionUi"]>[0],
+		/** pi's dialog timeout; the prompt is withdrawn once pi stops waiting. */
+		timeout?: number,
 	): Promise<void> {
 		const existing = this.#activeToolCallId;
 		const toolCallId = existing ?? `pi-dialog-${requestId}`;
@@ -980,11 +1057,15 @@ export class PiSession {
 		// Not awaited: pi is blocked on this dialog, and holding the event queue
 		// would stall any tool output still streaming alongside it.
 		void this.#acp
-			.request(methods.client.session.requestPermission, {
-				sessionId: this.sessionId,
-				options,
-				toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
-			})
+			.request(
+				methods.client.session.requestPermission,
+				{
+					sessionId: this.sessionId,
+					options,
+					toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
+				},
+				withTimeout(timeout),
+			)
 			.then(
 				(response) => {
 					const outcome = response.outcome;
@@ -1104,6 +1185,15 @@ function permissionKindFor(option: string): PermissionOption["kind"] {
 	const always = /\b(always|all|session|remember)\b/.test(lower);
 	if (rejecting) return always ? "reject_always" : "reject_once";
 	return always ? "allow_always" : "allow_once";
+}
+
+/**
+ * Withdraw a client prompt (`$/cancel_request`) once pi's own dialog timeout
+ * has passed: pi has already resolved the dialog by then.
+ */
+function withTimeout(timeout: number | undefined): SendRequestOptions | undefined {
+	if (!timeout || timeout <= 0) return undefined;
+	return { cancellationSignal: AbortSignal.timeout(timeout), stopWaitingOnCancel: true };
 }
 
 export function errorMessage(error: unknown): string {

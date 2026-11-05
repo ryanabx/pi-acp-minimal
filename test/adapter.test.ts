@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { AdapterError, createTestClient, type TestClient } from "./harness.js";
 
@@ -450,6 +450,89 @@ async function clientWith(clientCapabilities: Record<string, unknown>) {
 	const { sessionId } = await created.client.newSession({ cwd: created.workspace, mcpServers: [] });
 	return { client: created.client, sessionId, done: created.cleanup };
 }
+
+describe("extension dialogs as elicitations", () => {
+	it("asks a client with form elicitation to pick one of pi's choices", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = () => ({ action: "accept", content: { value: "green" } });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "SELECT please" }] });
+
+			expect(eliciting.elicitationRequests).toEqual([
+				{
+					mode: "form",
+					sessionId,
+					message: "Pick a colour",
+					requestedSchema: {
+						type: "object",
+						properties: {
+							value: {
+								type: "string",
+								oneOf: [
+									{ const: "red", title: "red" },
+									{ const: "green", title: "green" },
+								],
+							},
+						},
+						required: ["value"],
+					},
+				},
+			]);
+			expect(eliciting.permissionRequests).toHaveLength(0);
+			expect(eliciting.agentText()).toContain("answer: green");
+		} finally {
+			done();
+		}
+	});
+
+	it("asks for free text, and passes a declined form back as cancelled", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = () => ({ action: "accept", content: { value: "Grace" } });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "INPUT please" }] });
+			expect(eliciting.elicitationRequests[0]?.requestedSchema).toEqual({
+				type: "object",
+				properties: { value: { type: "string", description: "Ada" } },
+				required: ["value"],
+			});
+			expect(eliciting.agentText()).toContain("answer: Grace");
+
+			eliciting.elicitationAnswer = () => ({ action: "decline" });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "EDITOR please" }] });
+			expect(eliciting.elicitationRequests[1]?.requestedSchema).toMatchObject({
+				properties: { value: { type: "string", default: "line 1\nline 2" } },
+			});
+			expect(eliciting.agentText()).toContain("cancelled");
+		} finally {
+			done();
+		}
+	});
+
+	it("withdraws the elicitation once pi's dialog timeout has passed", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = "never";
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "SELECTSLOW please" }] });
+			expect(eliciting.agentText()).toContain("timed out");
+			await vi.waitFor(() => expect(eliciting.cancelledRequests).toHaveLength(1));
+		} finally {
+			done();
+		}
+	});
+
+	it("keeps the permission-prompt and cancel fallbacks for clients without elicitation", async () => {
+		const { sessionId } = await newSession();
+		client.permissionAnswer = "1";
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "SELECT please" }] });
+		expect(client.permissionRequests[0]?.options.map((o) => o.name)).toEqual(["red", "green"]);
+		expect(client.agentText()).toContain("answer: green");
+
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "INPUT please" }] });
+		expect(client.elicitationRequests).toHaveLength(0);
+		expect(client.agentText()).toContain('A pi extension asked for text input ("Your name?")');
+		expect(client.agentText()).toContain("cancelled");
+	});
+});
 
 describe("notices", () => {
 	it("sends pi's status messages as notices to a client that supports them", async () => {

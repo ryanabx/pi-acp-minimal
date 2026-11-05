@@ -5,6 +5,8 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type {
+	CreateElicitationRequest,
+	CreateElicitationResponse,
 	InitializeRequest,
 	InitializeResponse,
 	LoadSessionRequest,
@@ -57,6 +59,13 @@ export class TestClient {
 	readonly stderr: string[] = [];
 	/** Option id used to answer the next permission request; `null` cancels. */
 	permissionAnswer: string | null = null;
+	readonly elicitationRequests: CreateElicitationRequest[] = [];
+	/** Answers `elicitation/create`; `"never"` leaves the request unanswered. Default: cancel. */
+	elicitationAnswer: ((request: CreateElicitationRequest) => CreateElicitationResponse) | "never" = () => ({
+		action: "cancel",
+	});
+	/** Request ids the adapter withdrew with `$/cancel_request`. */
+	readonly cancelledRequests: Array<number | string> = [];
 	/** Files the adapter may read through `fs/read_text_file`, when enabled. */
 	readonly clientFiles = new Map<string, string>();
 	clientFsEnabled = false;
@@ -246,6 +255,16 @@ export class TestClient {
 						? { outcome: { outcome: "cancelled" } }
 						: { outcome: { outcome: "selected", optionId: this.permissionAnswer } },
 				);
+				return;
+			}
+			case "elicitation/create": {
+				const params = message.params as CreateElicitationRequest;
+				this.elicitationRequests.push(params);
+				if (this.elicitationAnswer !== "never") respond(this.elicitationAnswer(params));
+				return;
+			}
+			case "$/cancel_request": {
+				this.cancelledRequests.push((message.params as { requestId: number | string }).requestId);
 				return;
 			}
 			case "fs/read_text_file": {

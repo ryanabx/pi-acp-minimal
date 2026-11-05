@@ -245,22 +245,26 @@ pi's extension commands, prompt templates and skills are published as ACP
 can register commands at runtime). ACP clients send the chosen command back as
 plain `/name args` text, which is exactly what pi's `prompt` already expands.
 
-### Permission requests
+### Extension dialogs
 
 pi has no built-in permission system — it runs with the privileges of the user
 who launched it. What it does have is an extension UI protocol, which is how
-approval-style extensions ask questions. Those are bridged to ACP:
+approval-style extensions ask questions. Those are bridged to ACP, using form
+elicitation when the client advertises `elicitation.form`:
 
-| pi extension UI | ACP |
-|---|---|
-| `confirm` | `session/request_permission` with Yes / No options |
-| `select` | `session/request_permission`, one option each (kind inferred from the label) |
-| `notify` | italic `agent_message_chunk` |
-| `input`, `editor` | declined (ACP has no free-text prompt), reported to the user |
-| `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | ignored (TUI chrome) |
+| pi extension UI | ACP, with form elicitation | ACP, without |
+|---|---|---|
+| `confirm` | `session/request_permission` with Yes / No options | same |
+| `select` | `elicitation/create`, one single-choice field | `session/request_permission`, one option each (kind inferred from the label) |
+| `input` | `elicitation/create`, one text field (the placeholder as its description) | declined, reported to the user |
+| `editor` | `elicitation/create`, one text field prefilled with pi's text | declined, reported to the user |
+| `notify` | `notice` (with `session.notices`), else an italic `agent_message_chunk` | same |
+| `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | ignored (TUI chrome) | same |
 
-When a tool is running, the dialog attaches to that tool call; otherwise it gets
-a synthetic one so it still appears in the transcript.
+When a tool is running, the dialog attaches to that tool call; a permission
+prompt with no tool running gets a synthetic one so it still appears in the
+transcript. A dialog pi gives a timeout is withdrawn with `$/cancel_request`
+once pi has stopped waiting for it.
 
 ## Known limitations
 
