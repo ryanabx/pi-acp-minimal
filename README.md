@@ -60,8 +60,8 @@ Running from a local checkout instead:
   "agent_servers": {
     "pi": {
       "type": "custom",
-      "command": "node",
-      "args": ["/absolute/path/to/pi-acp-minimal/dist/cli.js"]
+      "command": "npx",
+      "args": ["/absolute/path/to/pi-acp-minimal/"]
     }
   }
 }
