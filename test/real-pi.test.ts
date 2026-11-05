@@ -59,6 +59,22 @@ describe.skipIf(!enabled)("real pi", () => {
 		}
 	}, 60_000);
 
+	it("reports pi's session name as the session title", async () => {
+		const { client, workspace, cleanup } = createTestClient({
+			piCommand,
+			extraArgs: (dir) => [...ownSessionDir(dir), "--", "--name", "Named by pi"],
+		});
+		try {
+			await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			await client.newSession({ cwd: workspace, mcpServers: [] });
+			await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "session_info_update"));
+			const update = client.updates.find((u) => u.sessionUpdate === "session_info_update");
+			expect(update).toMatchObject({ title: "Named by pi" });
+		} finally {
+			cleanup();
+		}
+	}, 60_000);
+
 	it("lists, resumes, closes and deletes pi's stored sessions", async () => {
 		// A `trash` that only deletes, so nothing lands in the machine's real trash.
 		const bin = fakeTrashBin();

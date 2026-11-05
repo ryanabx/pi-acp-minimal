@@ -25,6 +25,8 @@ const state = {
 	messageCount: 0,
 	pendingMessageCount: 0,
 	model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4", true),
+	// pi's --name flag names the session from the start.
+	...(process.argv.includes("--name") ? { sessionName: process.argv[process.argv.indexOf("--name") + 1] } : {}),
 };
 
 const models = [
@@ -100,6 +102,8 @@ const scenarios = [
 	{ match: /\bNOOP\b/, run: noopScenario },
 	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
 	{ match: /\bLEVELCHANGE\b/, run: levelChangeScenario },
+	{ match: /\bRENAME\b/, run: renameScenario },
+	{ match: /\bUNNAME\b/, run: unnameScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
@@ -329,6 +333,20 @@ async function selfAbortScenario() {
 	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
 	aborted = true;
 	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
+}
+
+/** An extension names the session, as `pi.setSessionName()` or `/name` would. */
+async function renameScenario() {
+	state.sessionName = "Renamed session";
+	write({ type: "session_info_changed", name: state.sessionName });
+	await textScenario();
+}
+
+/** The name is cleared: pi sends the event without `name`. */
+async function unnameScenario() {
+	delete state.sessionName;
+	write({ type: "session_info_changed" });
+	await textScenario();
 }
 
 /** An extension moves the thinking level mid-run, as pi 1.x reports it. */

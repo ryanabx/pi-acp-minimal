@@ -140,6 +140,7 @@ export class PiAcpAgent {
 		// session/load streams history while the request is in flight: the client
 		// already knows this session id because it supplied it.
 		await session.replayHistory();
+		await session.publishSessionInfo();
 		await session.publishCommands();
 		return { configOptions: session.configOptions() };
 	}

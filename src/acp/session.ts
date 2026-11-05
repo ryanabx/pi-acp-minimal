@@ -127,6 +127,10 @@ export class PiSession {
 	#commandSignature = "";
 	#configSignature = "";
 	#usageSignature = "";
+	/** pi's session name; `null` once known to be unset. */
+	#title: string | null = null;
+	/** The title the client was last told about; `undefined` before the first update. */
+	#publishedTitle: string | null | undefined;
 
 	constructor(options: PiSessionOptions) {
 		this.cwd = options.cwd;
@@ -162,6 +166,7 @@ export class PiSession {
 		this.sessionId = state.sessionFile ?? `${UNPERSISTED_SESSION_PREFIX}${state.sessionId}`;
 		this.#files = new FileAccess(this.#acp, this.#clientCapabilities, () => this.sessionId);
 
+		this.#title = state.sessionName ?? null;
 		await this.refreshModelState(state);
 		await this.refreshThinkingState(state);
 		// Seed the signature: session/new carries these options in its response.
@@ -333,12 +338,26 @@ export class PiSession {
 	publishSessionStateSoon(): void {
 		queueMicrotask(() => {
 			void (async () => {
+				await this.publishSessionInfo();
 				await this.publishCommands();
 				await this.publishUsage();
 			})().catch((error: unknown) => {
 				this.#log(`failed to publish initial session state: ${errorMessage(error)}`);
 			});
 		});
+	}
+
+	/**
+	 * Tell the client pi's session name, as the ACP session title.
+	 *
+	 * Sent once a session has a name (an unnamed new session stays quiet) and
+	 * again whenever it changes, including back to unnamed.
+	 */
+	async publishSessionInfo(): Promise<void> {
+		if (this.#title === this.#publishedTitle) return;
+		if (this.#publishedTitle === undefined && this.#title === null) return;
+		this.#publishedTitle = this.#title;
+		await this.#notify({ sessionUpdate: "session_info_update", title: this.#title });
 	}
 
 	/** Push pi's slash commands to the client, skipping unchanged lists. */
@@ -594,6 +613,11 @@ export class PiSession {
 				return this.#status(
 					`Retrying summarization (attempt ${event.attempt}/${event.maxAttempts}): ${event.errorMessage}`,
 				);
+
+			case "session_info_changed":
+				// /name, --name, or an extension's pi.setSessionName(); absent clears it.
+				this.#title = event.name?.trim() || null;
+				return this.publishSessionInfo();
 
 			case "extension_error":
 				this.#log(`extension error in ${event.extensionPath} (${event.event}): ${event.error}`);

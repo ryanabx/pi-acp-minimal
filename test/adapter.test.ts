@@ -443,6 +443,42 @@ describe("usage reporting", () => {
 	});
 });
 
+describe("session titles", () => {
+	const titles = (updates: typeof client.updates) =>
+		updates.flatMap((u) => (u.sessionUpdate === "session_info_update" ? [u.title] : []));
+
+	it("says nothing about an unnamed session", async () => {
+		await newSession();
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "available_commands_update"));
+		expect(titles(client.updates)).toEqual([]);
+	});
+
+	it("follows pi's session name as it is set and cleared", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "RENAME please" }] });
+		expect(titles(client.updates)).toEqual(["Renamed session"]);
+
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "UNNAME please" }] });
+		expect(titles(client.updates)).toEqual(["Renamed session", null]);
+	});
+
+	it("reports a name pi already has when the session opens", async () => {
+		const { client: named, workspace: dir, cleanup: done } = createTestClient({ extraArgs: ["--", "--name", "My chat"] });
+		try {
+			await named.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const { sessionId } = await named.newSession({ cwd: dir, mcpServers: [] });
+			await named.waitFor((updates) => titles(updates).length > 0);
+			expect(titles(named.updates)).toEqual(["My chat"]);
+
+			await named.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+			await named.loadSession({ sessionId, cwd: dir, mcpServers: [] });
+			expect(titles(named.updates)).toEqual(["My chat", "My chat"]);
+		} finally {
+			done();
+		}
+	});
+});
+
 describe("session/list and session/delete", () => {
 	it("lists pi's stored sessions and deletes one", async () => {
 		// A pi-format session store, and a `trash` that only deletes, so the test
