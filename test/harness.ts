@@ -5,6 +5,8 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import type {
+	CreateElicitationRequest,
+	CreateElicitationResponse,
 	InitializeRequest,
 	InitializeResponse,
 	LoadSessionRequest,
@@ -16,6 +18,8 @@ import type {
 	RequestPermissionRequest,
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
+
+import { ConformanceMonitor } from "./conformance/monitor.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
@@ -52,11 +56,23 @@ export class AdapterError extends Error {
  * `session/set_mode` from `setSessionModel`, which would make that untestable.)
  */
 export class TestClient {
+	/** Every client created, so the conformance check can inspect them after each test. */
+	static readonly instances = new Set<TestClient>();
+
+	/** Checks every frame in both directions against ACP v1; see conformance/monitor.ts. */
+	readonly conformance = new ConformanceMonitor();
 	readonly updates: Update[] = [];
 	readonly permissionRequests: RequestPermissionRequest[] = [];
 	readonly stderr: string[] = [];
 	/** Option id used to answer the next permission request; `null` cancels. */
 	permissionAnswer: string | null = null;
+	readonly elicitationRequests: CreateElicitationRequest[] = [];
+	/** Answers `elicitation/create`; `"never"` leaves the request unanswered. Default: cancel. */
+	elicitationAnswer: ((request: CreateElicitationRequest) => CreateElicitationResponse) | "never" = () => ({
+		action: "cancel",
+	});
+	/** Request ids the adapter withdrew with `$/cancel_request`. */
+	readonly cancelledRequests: Array<number | string> = [];
 	/** Files the adapter may read through `fs/read_text_file`, when enabled. */
 	readonly clientFiles = new Map<string, string>();
 	clientFsEnabled = false;
@@ -73,6 +89,7 @@ export class TestClient {
 
 	constructor(options: { workspace: string; piCommand?: string; extraArgs?: string[]; env?: NodeJS.ProcessEnv }) {
 		this.workspace = options.workspace;
+		TestClient.instances.add(this);
 		this.#process = spawn(
 			"node",
 			[
@@ -100,7 +117,16 @@ export class TestClient {
 			while ((index = buffer.indexOf("\n")) !== -1) {
 				const line = buffer.slice(0, index);
 				buffer = buffer.slice(index + 1);
-				if (line.trim()) this.#handle(JSON.parse(line) as JsonRpcMessage);
+				if (!line.trim()) continue;
+				let message: unknown;
+				try {
+					message = JSON.parse(line);
+				} catch {
+					this.conformance.fromAgent(line);
+					continue;
+				}
+				this.conformance.fromAgent(message);
+				this.#handle(message as JsonRpcMessage);
 			}
 		});
 	}
@@ -202,6 +228,7 @@ export class TestClient {
 	// --------------------------------------------------------------------------
 
 	#write(message: JsonRpcMessage): void {
+		this.conformance.fromClient(message);
 		this.#process.stdin.write(`${JSON.stringify(message)}\n`);
 	}
 
@@ -248,6 +275,16 @@ export class TestClient {
 				);
 				return;
 			}
+			case "elicitation/create": {
+				const params = message.params as CreateElicitationRequest;
+				this.elicitationRequests.push(params);
+				if (this.elicitationAnswer !== "never") respond(this.elicitationAnswer(params));
+				return;
+			}
+			case "$/cancel_request": {
+				this.cancelledRequests.push((message.params as { requestId: number | string }).requestId);
+				return;
+			}
 			case "fs/read_text_file": {
 				const params = message.params as { path: string };
 				const content = this.clientFiles.get(params.path);
@@ -271,13 +308,21 @@ export class TestClient {
 }
 
 /** Temporary workspace plus a connected client; the caller runs `cleanup`. */
-export function createTestClient(options: { piCommand?: string; extraArgs?: string[]; env?: NodeJS.ProcessEnv } = {}): {
+export function createTestClient(
+	options: {
+		piCommand?: string;
+		/** Extra adapter arguments, or a function of the new workspace that returns them. */
+		extraArgs?: string[] | ((workspace: string) => string[]);
+		env?: NodeJS.ProcessEnv;
+	} = {},
+): {
 	client: TestClient;
 	workspace: string;
 	cleanup: () => void;
 } {
 	const workspace = mkdtempSync(path.join(tmpdir(), "pi-acp-minimal-test-"));
-	const client = new TestClient({ workspace, ...options });
+	const extraArgs = typeof options.extraArgs === "function" ? options.extraArgs(workspace) : options.extraArgs;
+	const client = new TestClient({ workspace, ...options, extraArgs });
 	return {
 		client,
 		workspace,

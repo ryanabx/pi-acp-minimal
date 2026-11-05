@@ -11,6 +11,7 @@
 	"types": "dist/index.d.ts",
 	"files": [
 		"dist",
+		"pi-extension",
 		"npm-shrinkwrap.json"
 	],
 	"engines": {
@@ -22,6 +23,7 @@
 		"check": "tsc -p tsconfig.json --noEmit && npm run check:deps",
 		"check:deps": "node scripts/check-deps.mjs",
 		"check:package": "node scripts/check-package.mjs",
+		"check:pi-protocol": "tsc -p test/pi-protocol/tsconfig.json",
 		"audit": "npm audit --omit=dev && npm audit signatures --omit=dev",
 		"test": "vitest run",
 		"test:watch": "vitest",
@@ -29,12 +31,13 @@
 	},
 	"devDependencies": {
 		"@types/node": "22.19.19",
+		"ajv": "8.20.0",
 		"tsx": "4.22.1",
 		"typescript": "5.9.3",
 		"vitest": "3.2.7"
 	},
 	"dependencies": {
-		"@agentclientprotocol/sdk": "1.4.0"
+		"@agentclientprotocol/sdk": "2.4.0"
 	},
 	"repository": {
 		"type": "git",

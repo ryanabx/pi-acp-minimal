@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Readable, Writable } from "node:stream";
-import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
-import { PiAcpAgent } from "./acp/agent.js";
+import { ndJsonStream } from "@agentclientprotocol/sdk";
+import { createPiAgentApp } from "./acp/agent.js";
 import { traceStream } from "./acp/wire-trace.js";
 
 const USAGE = `pi-acp-minimal — Agent Client Protocol adapter for the pi coding agent
@@ -112,14 +112,11 @@ async function main(): Promise<void> {
 	const raw = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
 	const stream = logFile ? traceStream(raw, logFile) : raw;
 
-	let agent: PiAcpAgent | undefined;
-	new AgentSideConnection((connection) => {
-		agent = new PiAcpAgent(connection, { piCommand, piArgs, log });
-		return agent;
-	}, stream);
+	const { app, shutdown: stopPi } = createPiAgentApp({ piCommand, piArgs, log });
+	app.connect(stream);
 
 	const shutdown = async () => {
-		await agent?.shutdown();
+		await stopPi();
 		process.exit(0);
 	};
 	process.on("SIGINT", () => void shutdown());

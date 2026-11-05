@@ -95,22 +95,29 @@ skills and prompt templates load correctly for each session.
 
 ```
 src/
-  cli.ts              entry point: stdio -> AgentSideConnection -> PiAcpAgent
+  cli.ts              entry point: stdio -> ACP agent app -> PiAcpAgent
   acp/
-    agent.ts          ACP `Agent`: initialize, session/{new,load,prompt,cancel,set_mode,set_model}
+    agent.ts          ACP agent app: initialize, session/{new,load,resume,list,delete,close,prompt,cancel,set_config_option}
     session.ts        one pi process + the RPC-event -> session/update mapping
     file-access.ts    reads files via the client's fs when available, else local disk
     errors.ts         JSON-RPC errors that carry a readable message
+    wire-trace.ts     --log-file: every ACP frame to a JSONL file
   pi/
     rpc-types.ts      structural mirror of pi's RPC protocol
     rpc-client.ts     spawn pi, JSONL framing, request/response correlation
+    session-store.ts  pi's stored sessions, for session/list and session/delete
     jsonl.ts          LF-only framing (pi's protocol forbids splitting on U+2028/9)
+    find-executable.ts  PATH lookup without a shell
   map/
     content.ts        ACP ContentBlock <-> pi message content
     tools.ts          pi tool name/args -> ACP kind, title, locations
-    models.ts         pi Model <-> ACP ModelInfo
-    modes.ts          pi thinking level <-> ACP session mode
+    models.ts         pi Model <-> ACP model id
+    config.ts         pi model + thinking level -> ACP session config options
     commands.ts       pi slash command -> ACP AvailableCommand
+    usage.ts          pi session stats -> ACP usage_update
+    mcp.ts            ACP McpServer -> pi MCP server config
+pi-extension/
+  acp-mcp-servers.js  loaded into pi to register client-supplied MCP servers
 ```
 
 All pi stdout traffic is funnelled through a serial queue in `PiSession`, so
@@ -124,12 +131,27 @@ even where a mapping step has to await the file system.
 | ACP | pi RPC |
 |---|---|
 | `initialize` | — (capability negotiation only) |
-| `session/new` | spawn `pi --mode rpc` in `cwd`, then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
-| `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates |
+| `session/new` | spawn `pi --mode rpc` in `cwd` (plus the MCP extension when the client supplies servers), then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
+| `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates (stored compaction summaries as completed `compaction_update`s, for clients that track compactions) |
+| `session/resume` | spawn `pi --mode rpc --session <file>`, no replay |
+| `session/close` | `abort` if a turn is running, then stop the pi process |
+| `session/list` | read pi's session files (pi has no RPC command for it; see below) |
+| `session/delete` | delete a pi session file, through the `trash` CLI when installed, as pi's `/resume` picker does |
 | `session/prompt` | `prompt` |
 | `session/cancel` | `abort` |
 | `session/set_config_option` | `set_model` or `set_thinking_level` |
 | `authenticate` | — (pi owns its credentials; see below) |
+
+ACP session ids are pi session file paths, so `session/list` returns exactly
+what `session/load` and `session/resume` accept. Because pi's RPC protocol cannot
+list or delete sessions, the adapter reads pi's session store directly, using
+pi's own rules: `--session-dir` (passed through by `--session-dir` or after
+`--`), else `PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` in pi's global
+`settings.json`, else the per-directory layout under `~/.pi/agent/sessions/`
+(or `PI_CODING_AGENT_DIR`). Titles are pi's session name, else the first user
+message, as in pi's session picker. A project-level `sessionDir` setting is not
+read, because pi only honours it in trusted projects. `session/delete` only
+deletes pi session files inside that store.
 
 ### pi RPC events → ACP `session/update`
 
@@ -143,7 +165,9 @@ even where a mapping step has to await the file system.
 | `tool_execution_update` | `tool_call_update` with the accumulated output |
 | `tool_execution_end` | `tool_call_update` (status `completed`/`failed`), diff or text content, `rawOutput` |
 | `agent_settled` | resolves `session/prompt` |
-| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `extension_error` | italic `agent_message_chunk` status lines |
+| `compaction_start` / `compaction_end` | one `compaction_update` entity (in progress → completed with pi's summary, failed, or cancelled) when the client advertises `session.compaction`; otherwise status lines as below |
+| `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `extension_error`, extension `notify` | `notice` when the client advertises `session.notices`, else italic `agent_message_chunk` status lines |
+| `session_info_changed`, and `get_state.sessionName` when a session opens | `session_info_update` with the name as `title` (`null` when cleared) |
 | `get_commands` (polled after each turn) | `available_commands_update` |
 | `get_session_stats` (polled per turn) | `usage_update` |
 
@@ -228,27 +252,54 @@ pi's extension commands, prompt templates and skills are published as ACP
 can register commands at runtime). ACP clients send the chosen command back as
 plain `/name args` text, which is exactly what pi's `prompt` already expands.
 
-### Permission requests
+### MCP servers
+
+pi has no command-line flag or RPC command for adding MCP servers, but its
+extensions can register them for a session (`pi.registerMcpServer`). When a
+client supplies servers in `session/new`, `session/load` or `session/resume`,
+the adapter starts that session's pi with a small bundled extension
+([`pi-extension/acp-mcp-servers.js`](pi-extension/acp-mcp-servers.js)) that
+registers them; sessions without client servers start pi exactly as before.
+
+- stdio servers map to pi's `command`/`args`/`env`, HTTP servers to `url`/`headers`.
+- Server names are made valid for pi (letters, digits, `_`, `-`) and unique.
+  A server of the same name in pi's own `mcp.json` takes precedence, as pi
+  documents for extension-registered servers.
+- `env` and header values are escaped so pi uses them literally rather than
+  expanding `$VAR` or running `!command`. pi still expands a leading `~` in
+  `command` and `args`.
+- The servers reach the extension in an environment variable that it deletes
+  as it loads, so commands run by pi's tools cannot read header or env
+  credentials from it.
+- `--no-mcp`, or an extension that replaces pi's built-in MCP support, means the
+  servers are not connected; pi reports that as an extension error.
+
+### Extension dialogs
 
 pi has no built-in permission system — it runs with the privileges of the user
 who launched it. What it does have is an extension UI protocol, which is how
-approval-style extensions ask questions. Those are bridged to ACP:
+approval-style extensions ask questions. Those are bridged to ACP, using form
+elicitation when the client advertises `elicitation.form`:
 
-| pi extension UI | ACP |
-|---|---|
-| `confirm` | `session/request_permission` with Yes / No options |
-| `select` | `session/request_permission`, one option each (kind inferred from the label) |
-| `notify` | italic `agent_message_chunk` |
-| `input`, `editor` | declined (ACP has no free-text prompt), reported to the user |
-| `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | ignored (TUI chrome) |
+| pi extension UI | ACP, with form elicitation | ACP, without |
+|---|---|---|
+| `confirm` | `session/request_permission` with Yes / No options | same |
+| `select` | `elicitation/create`, one single-choice field | `session/request_permission`, one option each (kind inferred from the label) |
+| `input` | `elicitation/create`, one text field (the placeholder as its description) | declined, reported to the user |
+| `editor` | `elicitation/create`, one text field prefilled with pi's text | declined, reported to the user |
+| `notify` | `notice` (with `session.notices`), else an italic `agent_message_chunk` | same |
+| `setStatus`, `setWidget`, `setTitle`, `set_editor_text` | ignored (TUI chrome) | same |
 
-When a tool is running, the dialog attaches to that tool call; otherwise it gets
-a synthetic one so it still appears in the transcript.
+When a tool is running, the dialog attaches to that tool call; a permission
+prompt with no tool running gets a synthetic one so it still appears in the
+transcript. A dialog pi gives a timeout is withdrawn with `$/cancel_request`
+once pi has stopped waiting for it.
 
 ## Known limitations
 
-- **MCP servers** supplied by the client in `session/new` are ignored, with a
-  warning on stderr. pi loads MCP servers from its own settings.
+- **MCP over SSE.** pi only speaks stdio and streamable HTTP to MCP servers, so
+  client-supplied SSE servers are skipped with a warning (and
+  `mcpCapabilities.sse` is not advertised).
 - **Terminals.** pi runs shell commands itself, so `terminal/*` is not used;
   `bash` output is streamed as tool call content instead.
 - **Plans.** pi has no todo/plan tool, so no `plan` updates are emitted.
@@ -256,6 +307,14 @@ a synthetic one so it still appears in the transcript.
 - **Authentication.** pi manages provider credentials (`pi auth login`), so no
   ACP auth methods are advertised and `authenticate` returns a pointer to that
   command.
+  `logout` is not offered either: pi has no logout command, and its credentials
+  are per provider, not one session the client could end.
+- **Additional workspace roots** (`additionalDirectories`) are not advertised:
+  pi runs each session in a single working directory.
+- **Session modes** (`session/set_mode`) are not offered: pi has no modes; its
+  model and thinking level are config options instead.
+- **Renaming from the client.** pi's session name is reported as the session
+  title, but stable ACP v1 has no request for the client to set it.
 - **`session/load` requires session persistence.** Sessions started with
   `--no-session` get a non-reloadable id.
 - **Session modes** (`session/set_mode`) are not used. pi has no operating
@@ -283,7 +342,7 @@ read in one sitting, and enforces it in CI.
 
 ```
 pi-acp-minimal
-└─┬ @agentclientprotocol/sdk@1.4.0   (the ACP protocol implementation)
+└─┬ @agentclientprotocol/sdk@2.4.0   (the ACP protocol implementation)
   └── zod@4.6.7                      (its schema validator, a peer dependency)
 ```
 
@@ -304,7 +363,7 @@ The policy:
 - **`npm-shrinkwrap.json` is the committed lockfile**, not `package-lock.json`.
   npm honours a shrinkwrap when this package is installed as a dependency, so
   installing from git resolves the exact same versions and integrity hashes
-  recorded here. Without it, the SDK's `zod` peer range (`^3.25.0 || ^4.0.0`)
+  recorded here. Without it, the SDK's `zod` peer range (`^3.25.76 || ^4.0.0`)
   would resolve to whatever is newest at install time.
 - **CI installs with `npm ci --ignore-scripts`** and fails on any advisory
   affecting runtime dependencies. Dev-only advisories are reported without
@@ -339,12 +398,46 @@ npm run check         # typecheck + dependency policy
 npm test              # unit + end-to-end tests against a mock pi
 npm run build         # emit dist/
 npm run check:package # verify the published tarball
+npm run check:pi-protocol # rpc-types.ts against pi's types (see Conformance)
 ```
 
 `test/mock-pi.mjs` is a scripted stand-in for `pi --mode rpc`. Scenarios are
 selected by a marker in the prompt text (`TEXT`, `EDIT`, `BASH`, `CONFIRM`,
 `SLOW`, `RETRY`, …), which keeps the end-to-end tests deterministic and free of
 any provider dependency.
+
+### Conformance
+
+There is no official ACP conformance suite, so the adapter checks itself against
+the two protocols it sits between:
+
+- **ACP.** Every test client runs a `ConformanceMonitor`
+  ([`test/conformance/`](test/conformance/)) over its connection. It validates
+  every frame, in both directions, against the official ACP v1 JSON schema
+  shipped with the SDK, choosing the definition for each payload's method, and
+  checks the rules a schema cannot express: JSON-RPC framing and response
+  bookkeeping, nothing before `initialize`, no updates for sessions the client
+  does not know yet or has closed, features such as notices, compaction updates
+  and elicitation only when the client advertised them, and tool call updates
+  only for announced tool calls. Any violation fails the test, so the whole
+  suite doubles as a conformance suite. `test/conformance.test.ts` proves each
+  rule fires and sweeps every mock scenario for a client that advertises
+  nothing and one that advertises everything.
+- **pi.** `npm run check:pi-protocol` compiles
+  [`test/pi-protocol/check.ts`](test/pi-protocol/check.ts), which compares the
+  hand-written mirror in `src/pi/rpc-types.ts` with the published types of the
+  pi release pinned in `test/pi-protocol/package.json`: everything pi sends must
+  fit the mirror, everything the adapter sends must fit pi, and neither side may
+  use fields the other does not define. It needs that package installed first:
+
+  ```bash
+  npm ci --ignore-scripts --prefix test/pi-protocol
+  npm run check:pi-protocol
+  ```
+
+  To track a new pi release, bump the version there, run
+  `npm install --ignore-scripts --prefix test/pi-protocol`, and fix what the
+  check reports.
 
 To also run smoke tests against a real pi install (handshake, session setup and
 a live cancel — no model provider needed):
@@ -366,7 +459,12 @@ enough to assert on.
 
 ### A note on the ACP TypeScript SDK
 
-This uses `@agentclientprotocol/sdk`, the current official TypeScript SDK.
+This uses `@agentclientprotocol/sdk`, the current official TypeScript SDK, through
+its default entrypoint: stable ACP protocol v1. SDK 2.x versions its API
+separately from the protocol; its draft protocol v2 lives under
+`@agentclientprotocol/sdk/experimental/v2` and can change incompatibly in any
+release, and its `/unstable` entrypoints add v1 features that are not yet
+stable. The adapter uses neither.
 
 Beware of `@zed-industries/agent-client-protocol`: it is the *old* package name,
 its newest release (0.4.5) is far behind the protocol Zed actually speaks, and

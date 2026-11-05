@@ -1,21 +1,26 @@
-import type {
-	AgentSideConnection,
-	AvailableCommand,
-	ClientCapabilities,
-	ContentBlock,
-	PermissionOption,
-	SessionConfigOption,
-	PromptResponse,
-	SessionNotification,
-	ToolCallContent,
-	ToolCallLocation,
-	ToolCallStatus,
-	ToolKind,
+import {
+	type AgentContext,
+	type AvailableCommand,
+	type ClientCapabilities,
+	type ContentBlock,
+	type ElicitationPropertySchema,
+	methods,
+	type SendRequestOptions,
+	type PermissionOption,
+	type PromptResponse,
+	type SessionConfigOption,
+	type SessionNotification,
+	type ToolCallContent,
+	type ToolCallLocation,
+	type ToolCallStatus,
+	type ToolKind,
 } from "@agentclientprotocol/sdk";
+import { fileURLToPath } from "node:url";
 import { toAcpCommand } from "../map/commands.js";
 import { assistantText, toAcpContentBlocks } from "../map/content.js";
 import { buildConfigOptions } from "../map/config.js";
 import { fromAcpModelId, toAcpModelId } from "../map/models.js";
+import type { PiMcpServerConfig } from "../map/mcp.js";
 import { isFileMutatingTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
 import { toAcpUsageUpdate } from "../map/usage.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
@@ -38,7 +43,8 @@ import { FileAccess } from "./file-access.js";
 type PromptStopReason = PromptResponse["stopReason"];
 
 export interface PiSessionOptions {
-	connection: AgentSideConnection;
+	/** Calls back into the ACP client for the lifetime of the connection. */
+	client: AgentContext;
 	clientCapabilities: ClientCapabilities | undefined;
 	cwd: string;
 	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
@@ -47,6 +53,8 @@ export interface PiSessionOptions {
 	env?: NodeJS.ProcessEnv;
 	/** Existing pi session file to resume, for `session/load`. */
 	resumeSessionFile?: string;
+	/** MCP servers the client supplied, in pi's format, keyed by server name. */
+	mcpServers?: Record<string, PiMcpServerConfig>;
 	log: (message: string) => void;
 }
 
@@ -62,6 +70,9 @@ interface ToolCallState {
 	filePath?: string;
 	announced: boolean;
 }
+
+/** The pi extension that registers client-supplied MCP servers; see the file for why. */
+const MCP_EXTENSION = fileURLToPath(new URL("../../pi-extension/acp-mcp-servers.js", import.meta.url));
 
 /** Session id prefix used when pi runs without session persistence. */
 export const UNPERSISTED_SESSION_PREFIX = "pi-session:";
@@ -95,7 +106,7 @@ export class PiSession {
 	readonly cwd: string;
 	sessionId!: string;
 
-	#connection: AgentSideConnection;
+	#acp: AgentContext;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#client: PiRpcClient;
 	#files!: FileAccess;
@@ -125,21 +136,37 @@ export class PiSession {
 	#commandSignature = "";
 	#configSignature = "";
 	#usageSignature = "";
+	/** Compactions announced to the client so far; numbers their ids. */
+	#compactions = 0;
+	/** The compaction pi is running now, if the client tracks compactions. */
+	#activeCompactionId: string | null = null;
+	/** pi's session name; `null` once known to be unset. */
+	#title: string | null = null;
+	/** The title the client was last told about; `undefined` before the first update. */
+	#publishedTitle: string | null | undefined;
 
 	constructor(options: PiSessionOptions) {
 		this.cwd = options.cwd;
-		this.#connection = options.connection;
+		this.#acp = options.client;
 		this.#clientCapabilities = options.clientCapabilities;
 		this.#log = options.log;
 
 		const args = [...options.piArgs];
 		if (options.resumeSessionFile) args.push("--session", options.resumeSessionFile);
 
+		let env = options.env;
+		if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
+			// The extension reads the servers and removes the variable before any
+			// tool runs, so header and env values never reach the commands pi runs.
+			args.push("-e", MCP_EXTENSION);
+			env = { ...(options.env ?? process.env), PI_ACP_MCP_SERVERS: JSON.stringify(options.mcpServers) };
+		}
+
 		this.#client = new PiRpcClient({
 			command: options.piCommand,
 			args,
 			cwd: options.cwd,
-			env: options.env,
+			env,
 			onEvent: (event) => this.#enqueue(() => this.#handleEvent(event)),
 			onExtensionUiRequest: (request) => this.#enqueue(() => this.#handleExtensionUi(request)),
 			onStderr: (chunk) => this.#log(chunk.trimEnd()),
@@ -158,8 +185,9 @@ export class PiSession {
 		const state = await this.#client.request({ type: "get_state" });
 		// The session file doubles as the ACP session id so `session/load` can resume it.
 		this.sessionId = state.sessionFile ?? `${UNPERSISTED_SESSION_PREFIX}${state.sessionId}`;
-		this.#files = new FileAccess(this.#connection, this.#clientCapabilities, () => this.sessionId);
+		this.#files = new FileAccess(this.#acp, this.#clientCapabilities, () => this.sessionId);
 
+		this.#title = state.sessionName ?? null;
 		await this.refreshModelState(state);
 		await this.refreshThinkingState(state);
 		// Seed the signature: session/new carries these options in its response.
@@ -168,6 +196,21 @@ export class PiSession {
 
 	async stop(): Promise<void> {
 		await this.#client.stop();
+	}
+
+	/**
+	 * Cancel any running turn, then stop pi.
+	 *
+	 * Once pi is gone no `agent_settled` can arrive, so a turn still waiting on
+	 * one ends here as cancelled rather than hanging its `session/prompt`.
+	 */
+	async close(): Promise<void> {
+		await this.cancel();
+		await this.stop();
+		this.#stopIdleWatchdog();
+		const turn = this.#turn;
+		this.#turn = null;
+		turn?.resolve("cancelled");
 	}
 
 	/**
@@ -308,20 +351,37 @@ export class PiSession {
 	// ==========================================================================
 
 	/**
-	 * Publish commands and usage once the caller's own response has been sent.
+	 * Publish the title, commands and usage once the caller's own response has been sent.
 	 *
 	 * Used by `session/new`, where notifying before the response would reference a
-	 * session the client has not registered yet.
+	 * session the client has not registered yet. The SDK queues a response for
+	 * writing only after the handler's promise settles, several microtasks later,
+	 * so a microtask is too early; the next macrotask runs after the response is
+	 * queued, and the SDK writes frames in the order they were queued.
 	 */
 	publishSessionStateSoon(): void {
-		queueMicrotask(() => {
+		setImmediate(() => {
 			void (async () => {
+				await this.publishSessionInfo();
 				await this.publishCommands();
 				await this.publishUsage();
 			})().catch((error: unknown) => {
 				this.#log(`failed to publish initial session state: ${errorMessage(error)}`);
 			});
 		});
+	}
+
+	/**
+	 * Tell the client pi's session name, as the ACP session title.
+	 *
+	 * Sent once a session has a name (an unnamed new session stays quiet) and
+	 * again whenever it changes, including back to unnamed.
+	 */
+	async publishSessionInfo(): Promise<void> {
+		if (this.#title === this.#publishedTitle) return;
+		if (this.#publishedTitle === undefined && this.#title === null) return;
+		this.#publishedTitle = this.#title;
+		await this.#notify({ sessionUpdate: "session_info_update", title: this.#title });
 	}
 
 	/** Push pi's slash commands to the client, skipping unchanged lists. */
@@ -492,10 +552,21 @@ export class PiSession {
 				return;
 			}
 
+			case "compactionSummary":
+				// A client that tracks compactions shows where one happened; for
+				// anyone else the summary is model context, not transcript.
+				if (!this.#tracksCompactions) return;
+				return this.#notify({
+					sessionUpdate: "compaction_update",
+					compactionId: this.#nextCompactionId(),
+					status: "completed",
+					summary: [{ type: "text", text: message.summary }],
+				});
+
 			default:
-				// system, branchSummary and compactionSummary are model context, not
-				// transcript: pi sends them in get_messages but they are not part of
-				// the conversation a client wants reloaded.
+				// system and branchSummary are model context, not transcript: pi
+				// sends them in get_messages but they are not part of the
+				// conversation a client wants reloaded.
 				return;
 		}
 	}
@@ -546,11 +617,22 @@ export class PiSession {
 				return this.#settleTurn(event.aborted === true);
 
 			case "compaction_start":
+				if (this.#tracksCompactions) {
+					this.#activeCompactionId = this.#nextCompactionId();
+					return this.#notify({
+						sessionUpdate: "compaction_update",
+						compactionId: this.#activeCompactionId,
+						status: "in_progress",
+					});
+				}
 				return this.#status(`Compacting context (${event.reason})…`);
 
 			case "compaction_end": {
+				if (this.#tracksCompactions) return this.#endCompaction(event);
 				if (event.aborted) return this.#status("Compaction aborted.");
-				if (!event.result) return this.#status(`Compaction failed: ${event.errorMessage ?? "unknown error"}`);
+				if (!event.result) {
+					return this.#status("Compaction failed", { level: "error", description: event.errorMessage ?? "unknown error" });
+				}
 				const before = event.result.tokensBefore;
 				const after = event.result.estimatedTokensAfter;
 				const detail = before && after ? ` (~${before} → ~${after} tokens)` : "";
@@ -565,22 +647,31 @@ export class PiSession {
 
 			case "auto_retry_start":
 				return this.#status(
-					`Retrying after error (attempt ${event.attempt}/${event.maxAttempts}, ` +
-						`waiting ${Math.round(event.delayMs / 1000)}s): ${event.errorMessage}`,
+					`Retrying after error (attempt ${event.attempt}/${event.maxAttempts}, waiting ${Math.round(event.delayMs / 1000)}s)`,
+					{ level: "warning", description: event.errorMessage },
 				);
 
 			case "auto_retry_end":
 				if (event.success) return this.#status(`Retry succeeded on attempt ${event.attempt}.`);
-				return this.#status(`Retries exhausted after ${event.attempt} attempts: ${event.finalError ?? "unknown error"}`);
+				return this.#status(`Retries exhausted after ${event.attempt} attempts`, {
+					level: "error",
+					description: event.finalError ?? "unknown error",
+				});
 
 			case "summarization_retry_scheduled":
-				return this.#status(
-					`Retrying summarization (attempt ${event.attempt}/${event.maxAttempts}): ${event.errorMessage}`,
-				);
+				return this.#status(`Retrying summarization (attempt ${event.attempt}/${event.maxAttempts})`, {
+					level: "warning",
+					description: event.errorMessage,
+				});
+
+			case "session_info_changed":
+				// /name, --name, or an extension's pi.setSessionName(); absent clears it.
+				this.#title = event.name?.trim() || null;
+				return this.publishSessionInfo();
 
 			case "extension_error":
 				this.#log(`extension error in ${event.extensionPath} (${event.event}): ${event.error}`);
-				return this.#status(`Extension error (${event.event}): ${event.error}`);
+				return this.#status(`Extension error (${event.event})`, { level: "error", description: event.error });
 
 			default:
 				// agent_end, turn_start, queue_update and the remaining retry events
@@ -829,7 +920,7 @@ export class PiSession {
 	async #handleExtensionUi(request: PiExtensionUiRequest): Promise<void> {
 		switch (request.method) {
 			case "notify":
-				return this.#status(request.message, request.notifyType);
+				return this.#status(request.message, { level: request.notifyType });
 
 			case "confirm":
 				return this.#askPermission(
@@ -841,9 +932,18 @@ export class PiSession {
 					],
 					(optionId) => ({ type: "extension_ui_response", id: request.id, confirmed: optionId === "yes" }),
 					{ type: "extension_ui_response", id: request.id, confirmed: false },
+					request.timeout,
 				);
 
 			case "select":
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						oneOf: request.options.map((option) => ({ const: option, title: option })),
+					}, request.timeout);
+				}
+				// Without elicitation, a choice is rendered as a permission prompt
+				// whose options are pi's choices.
 				return this.#askPermission(
 					request.id,
 					request.title,
@@ -859,23 +959,87 @@ export class PiSession {
 							: { type: "extension_ui_response", id: request.id, value };
 					},
 					{ type: "extension_ui_response", id: request.id, cancelled: true },
+					request.timeout,
 				);
 
 			case "input":
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						...(request.placeholder ? { description: request.placeholder } : {}),
+					}, request.timeout);
+				}
+				return this.#declineTextInput(request.id, request.title);
+
 			case "editor":
-				// ACP has no free-text prompt; decline so the extension takes its
-				// cancellation path instead of blocking pi forever.
-				this.#client.respondExtensionUi({ type: "extension_ui_response", id: request.id, cancelled: true });
-				return this.#status(
-					`A pi extension asked for text input ("${request.title}"), which ACP cannot display. The request was cancelled.`,
-					"warning",
-				);
+				if (this.#supportsFormElicitation) {
+					return this.#elicitText(request.id, request.title, {
+						type: "string",
+						...(request.prefill ? { default: request.prefill } : {}),
+					});
+				}
+				return this.#declineTextInput(request.id, request.title);
 
 			default:
 				// setStatus / setWidget / setTitle / set_editor_text are TUI chrome.
 				this.#log(`ignoring extension UI request: ${request.method}`);
 				return;
 		}
+	}
+
+	/** Whether the client renders form elicitations (`elicitation.form`). */
+	get #supportsFormElicitation(): boolean {
+		return this.#clientCapabilities?.elicitation?.form != null;
+	}
+
+	/**
+	 * Ask the user for one value through an ACP form elicitation, and hand it to pi.
+	 *
+	 * The form has a single required field. It is tied to the running tool
+	 * call, if any, like the permission prompts. When pi gives the dialog a
+	 * timeout, the elicitation is withdrawn once pi has stopped waiting.
+	 */
+	async #elicitText(piRequestId: string, message: string, field: ElicitationPropertySchema, timeout?: number): Promise<void> {
+		const toolCallId = this.#activeToolCallId;
+		// Not awaited: pi is blocked on this dialog, and holding the event queue
+		// would stall any tool output still streaming alongside it.
+		void this.#acp
+			.request(
+				methods.client.elicitation.create,
+				{
+					mode: "form",
+					sessionId: this.sessionId,
+					...(toolCallId ? { toolCallId } : {}),
+					message,
+					requestedSchema: { type: "object", properties: { value: field }, required: ["value"] },
+				},
+				withTimeout(timeout),
+			)
+			.then(
+				(response) => {
+					const value = response.action === "accept" && isPlainObject(response.content) ? response.content.value : undefined;
+					this.#client.respondExtensionUi(
+						typeof value === "string"
+							? { type: "extension_ui_response", id: piRequestId, value }
+							: { type: "extension_ui_response", id: piRequestId, cancelled: true },
+					);
+				},
+				(error: unknown) => {
+					this.#log(`elicitation failed: ${errorMessage(error)}`);
+					this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
+				},
+			);
+	}
+
+	/** Without elicitation there is no free-text prompt: cancel, and say why. */
+	async #declineTextInput(piRequestId: string, title: string): Promise<void> {
+		// Decline so the extension takes its cancellation path instead of
+		// blocking pi forever.
+		this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
+		return this.#status(`A pi extension asked for text input ("${title}")`, {
+			level: "warning",
+			description: "This client cannot show text prompts (no form elicitation), so the request was cancelled.",
+		});
 	}
 
 	/**
@@ -890,6 +1054,8 @@ export class PiSession {
 		options: PermissionOption[],
 		toResponse: (optionId: string) => Parameters<PiRpcClient["respondExtensionUi"]>[0],
 		onCancel: Parameters<PiRpcClient["respondExtensionUi"]>[0],
+		/** pi's dialog timeout; the prompt is withdrawn once pi stops waiting. */
+		timeout?: number,
 	): Promise<void> {
 		const existing = this.#activeToolCallId;
 		const toolCallId = existing ?? `pi-dialog-${requestId}`;
@@ -908,12 +1074,16 @@ export class PiSession {
 
 		// Not awaited: pi is blocked on this dialog, and holding the event queue
 		// would stall any tool output still streaming alongside it.
-		void this.#connection
-			.requestPermission({
-				sessionId: this.sessionId,
-				options,
-				toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
-			})
+		void this.#acp
+			.request(
+				methods.client.session.requestPermission,
+				{
+					sessionId: this.sessionId,
+					options,
+					toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
+				},
+				withTimeout(timeout),
+			)
 			.then(
 				(response) => {
 					const outcome = response.outcome;
@@ -940,17 +1110,76 @@ export class PiSession {
 	// Notification helpers
 	// ==========================================================================
 
-	/** Out-of-band progress text, rendered as an italic agent message line. */
-	async #status(message: string, level: "info" | "warning" | "error" = "info"): Promise<void> {
-		const prefix = level === "error" ? "⚠ " : level === "warning" ? "⚠ " : "";
+	/** Whether the client advertised `session.compaction`, which compaction updates require. */
+	get #tracksCompactions(): boolean {
+		return Boolean(this.#clientCapabilities?.session?.compaction);
+	}
+
+	#nextCompactionId(): string {
+		return `pi-compaction-${++this.#compactions}`;
+	}
+
+	/** Finish the compaction entity opened on `compaction_start`. */
+	async #endCompaction(event: Extract<PiRpcEvent, { type: "compaction_end" }>): Promise<void> {
+		// An end without a start we saw still gets an entity of its own.
+		const compactionId = this.#activeCompactionId ?? this.#nextCompactionId();
+		this.#activeCompactionId = null;
+		if (event.aborted) {
+			return this.#notify({ sessionUpdate: "compaction_update", compactionId, status: "cancelled" });
+		}
+		if (!event.result) {
+			return this.#notify({
+				sessionUpdate: "compaction_update",
+				compactionId,
+				status: "failed",
+				error: event.errorMessage ?? "unknown error",
+			});
+		}
+		return this.#notify({
+			sessionUpdate: "compaction_update",
+			compactionId,
+			status: "completed",
+			summary: [{ type: "text", text: event.result.summary }],
+		});
+	}
+
+	/**
+	 * Out-of-band information for the user: retries, extension messages and the like.
+	 *
+	 * Sent as an ACP `notice` when the client advertises `session.notices`;
+	 * otherwise as an italic agent message line, which is the fallback the
+	 * protocol suggests. A multi-line title keeps its first line as the title
+	 * and moves the rest into the description.
+	 */
+	async #status(
+		title: string,
+		{ level = "info", description }: { level?: "info" | "warning" | "error"; description?: string } = {},
+	): Promise<void> {
+		const [first = "", ...rest] = title.trim().split(/\n+/);
+		const detail = [rest.join(" ").trim(), description?.trim()].filter(Boolean).join(" ") || undefined;
+		const heading = first.trim() || detail;
+		if (!heading) return;
+
+		if (this.#clientCapabilities?.session?.notices) {
+			await this.#notify({
+				sessionUpdate: "notice",
+				severity: level,
+				title: heading,
+				...(detail && heading !== detail ? { description: detail } : {}),
+			});
+			return;
+		}
+
+		const prefix = level === "info" ? "" : "⚠ ";
+		const text = detail && heading !== detail ? `${heading}: ${detail}` : heading;
 		await this.#notify({
 			sessionUpdate: "agent_message_chunk",
-			content: { type: "text", text: `\n_${prefix}${message.replace(/\n+/g, " ")}_\n` },
+			content: { type: "text", text: `\n_${prefix}${text.replace(/\n+/g, " ")}_\n` },
 		});
 	}
 
 	async #notify(update: SessionNotification["update"]): Promise<void> {
-		await this.#connection.sessionUpdate({ sessionId: this.sessionId, update });
+		await this.#acp.notify(methods.client.session.update, { sessionId: this.sessionId, update });
 	}
 }
 
@@ -974,6 +1203,15 @@ function permissionKindFor(option: string): PermissionOption["kind"] {
 	const always = /\b(always|all|session|remember)\b/.test(lower);
 	if (rejecting) return always ? "reject_always" : "reject_once";
 	return always ? "allow_always" : "allow_once";
+}
+
+/**
+ * Withdraw a client prompt (`$/cancel_request`) once pi's own dialog timeout
+ * has passed: pi has already resolved the dialog by then.
+ */
+function withTimeout(timeout: number | undefined): SendRequestOptions | undefined {
+	if (!timeout || timeout <= 0) return undefined;
+	return { cancellationSignal: AbortSignal.timeout(timeout), stopWaitingOnCancel: true };
 }
 
 export function errorMessage(error: unknown): string {

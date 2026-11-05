@@ -6,7 +6,7 @@
  * adapter can be exercised end to end without a provider or an LLM. The prompt
  * text selects the scenario; see `scenarios` below.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -25,6 +25,8 @@ const state = {
 	messageCount: 0,
 	pendingMessageCount: 0,
 	model: model("anthropic", "claude-sonnet-4", "Claude Sonnet 4", true),
+	// pi's --name flag names the session from the start.
+	...(process.argv.includes("--name") ? { sessionName: process.argv[process.argv.indexOf("--name") + 1] } : {}),
 };
 
 const models = [
@@ -38,6 +40,14 @@ const models = [
 const resumeIndex = process.argv.indexOf("--session");
 if (resumeIndex !== -1 && process.argv[resumeIndex + 1]) {
 	state.sessionFile = process.argv[resumeIndex + 1];
+}
+
+/** MOCK_PI_RECORD: append how this pi was started, for tests that check the launch. */
+if (process.env.MOCK_PI_RECORD) {
+	appendFileSync(
+		process.env.MOCK_PI_RECORD,
+		`${JSON.stringify({ argv: process.argv.slice(2), mcpServers: process.env.PI_ACP_MCP_SERVERS ?? null })}\n`,
+	);
 }
 
 const messages = existsSync(state.sessionFile) ? JSON.parse(readFileSync(state.sessionFile, "utf8")) : [];
@@ -95,11 +105,19 @@ const scenarios = [
 	{ match: /\bRETRY\b/, run: retryScenario },
 	{ match: /\bSLOW\b/, run: slowScenario },
 	{ match: /\bCONFIRM\b/, run: confirmScenario },
+	{ match: /\bSELECTSLOW\b/, run: () => dialogScenario({ method: "select", title: "Pick fast", options: ["a", "b"], timeout: 300 }) },
+	{ match: /\bSELECT\b/, run: () => dialogScenario({ method: "select", title: "Pick a colour", options: ["red", "green"] }) },
+	{ match: /\bINPUT\b/, run: () => dialogScenario({ method: "input", title: "Your name?", placeholder: "Ada" }) },
+	{ match: /\bEDITOR\b/, run: () => dialogScenario({ method: "editor", title: "Edit notes", prefill: "line 1\nline 2" }) },
 	{ match: /\bNESTED\b/, run: nestedScenario },
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
 	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
 	{ match: /\bLEVELCHANGE\b/, run: levelChangeScenario },
+	{ match: /\bRENAME\b/, run: renameScenario },
+	{ match: /\bCOMPACTFAIL\b/, run: compactFailScenario },
+	{ match: /\bCOMPACT\b/, run: compactScenario },
+	{ match: /\bUNNAME\b/, run: unnameScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
@@ -247,6 +265,27 @@ async function slowScenario() {
 	endAssistant([{ type: "text", text: "." }], aborted ? "aborted" : "stop");
 }
 
+let dialogCount = 0;
+
+/**
+ * An extension dialog whose answer the assistant echoes back.
+ *
+ * Like pi, a dialog with a `timeout` resolves to "no answer" by itself once
+ * it expires, whatever the client does later.
+ */
+async function dialogScenario(request) {
+	const id = `dialog-${++dialogCount}`;
+	write({ type: "extension_ui_request", id, ...request });
+	const answer = await (request.timeout
+		? Promise.race([waitForUiResponse(id), sleep(request.timeout).then(() => ({ timedOut: true }))])
+		: waitForUiResponse(id));
+	const text = answer.timedOut ? "timed out" : answer.cancelled ? "cancelled" : `answer: ${answer.value}`;
+	startAssistant();
+	delta({ type: "text_start", contentIndex: 0 });
+	delta({ type: "text_delta", contentIndex: 0, delta: text });
+	endAssistant([{ type: "text", text }], "stop");
+}
+
 async function confirmScenario() {
 	write({ type: "extension_ui_request", id: "ui-1", method: "confirm", title: "Run dangerous command?", message: "rm -rf /tmp/x" });
 	const answer = await waitForUiResponse("ui-1");
@@ -329,6 +368,43 @@ async function selfAbortScenario() {
 	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
 	aborted = true;
 	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
+}
+
+/** pi compacts the context before answering, as it does past its threshold. */
+async function compactScenario() {
+	write({ type: "compaction_start", reason: "threshold" });
+	await sleep(5);
+	const summary = "Summary of the earlier conversation.";
+	messages.push({ role: "compactionSummary", summary, tokensBefore: 1000, timestamp: Date.now() });
+	write({
+		type: "compaction_end",
+		reason: "threshold",
+		result: { summary, firstKeptEntryId: "e1", tokensBefore: 1000, estimatedTokensAfter: 200, details: {} },
+		aborted: false,
+		willRetry: false,
+	});
+	await textScenario();
+}
+
+/** Compaction fails: pi omits the result and reports the error. */
+async function compactFailScenario() {
+	write({ type: "compaction_start", reason: "manual" });
+	write({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false, errorMessage: "model refused" });
+	await textScenario();
+}
+
+/** An extension names the session, as `pi.setSessionName()` or `/name` would. */
+async function renameScenario() {
+	state.sessionName = "Renamed session";
+	write({ type: "session_info_changed", name: state.sessionName });
+	await textScenario();
+}
+
+/** The name is cleared: pi sends the event without `name`. */
+async function unnameScenario() {
+	delete state.sessionName;
+	write({ type: "session_info_changed" });
+	await textScenario();
 }
 
 /** An extension moves the thinking level mid-run, as pi 1.x reports it. */

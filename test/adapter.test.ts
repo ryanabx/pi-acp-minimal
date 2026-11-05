@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { AdapterError, createTestClient, type TestClient } from "./harness.js";
 
@@ -40,6 +40,8 @@ describe("initialize", () => {
 			expect(response.protocolVersion).toBe(PROTOCOL_VERSION);
 			expect(response.agentCapabilities?.loadSession).toBe(true);
 			expect(response.agentCapabilities?.promptCapabilities).toMatchObject({ image: true, embeddedContext: true });
+			expect(response.agentCapabilities?.sessionCapabilities).toMatchObject({ resume: {}, close: {} });
+			expect(response.agentInfo).toMatchObject({ name: "pi-acp-minimal" });
 		} finally {
 			done();
 		}
@@ -432,12 +434,327 @@ describe("usage reporting", () => {
 
 	it("stays quiet when pi has no context figure to report", async () => {
 		const { sessionId } = await newSession();
+		// The session-start report follows the session/new response; let it land
+		// before the scenario stops pi from reporting a figure.
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "usage_update"));
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "NOSTATS please" }] });
 		const afterPrompt = client.updates
 			.filter((u) => u.sessionUpdate === "usage_update")
 			.map((u) => (u.sessionUpdate === "usage_update" ? u.used : -1));
 		// Only the session-start report; the turn itself yielded nothing new.
 		expect(afterPrompt).toEqual([0]);
+	});
+});
+
+/** A second client that advertises extra capabilities; the caller runs `done`. */
+async function clientWith(clientCapabilities: Record<string, unknown>) {
+	const created = createTestClient();
+	await created.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities });
+	const { sessionId } = await created.client.newSession({ cwd: created.workspace, mcpServers: [] });
+	return { client: created.client, sessionId, done: created.cleanup };
+}
+
+describe("extension dialogs as elicitations", () => {
+	it("asks a client with form elicitation to pick one of pi's choices", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = () => ({ action: "accept", content: { value: "green" } });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "SELECT please" }] });
+
+			expect(eliciting.elicitationRequests).toEqual([
+				{
+					mode: "form",
+					sessionId,
+					message: "Pick a colour",
+					requestedSchema: {
+						type: "object",
+						properties: {
+							value: {
+								type: "string",
+								oneOf: [
+									{ const: "red", title: "red" },
+									{ const: "green", title: "green" },
+								],
+							},
+						},
+						required: ["value"],
+					},
+				},
+			]);
+			expect(eliciting.permissionRequests).toHaveLength(0);
+			expect(eliciting.agentText()).toContain("answer: green");
+		} finally {
+			done();
+		}
+	});
+
+	it("asks for free text, and passes a declined form back as cancelled", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = () => ({ action: "accept", content: { value: "Grace" } });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "INPUT please" }] });
+			expect(eliciting.elicitationRequests[0]?.requestedSchema).toEqual({
+				type: "object",
+				properties: { value: { type: "string", description: "Ada" } },
+				required: ["value"],
+			});
+			expect(eliciting.agentText()).toContain("answer: Grace");
+
+			eliciting.elicitationAnswer = () => ({ action: "decline" });
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "EDITOR please" }] });
+			expect(eliciting.elicitationRequests[1]?.requestedSchema).toMatchObject({
+				properties: { value: { type: "string", default: "line 1\nline 2" } },
+			});
+			expect(eliciting.agentText()).toContain("cancelled");
+		} finally {
+			done();
+		}
+	});
+
+	it("withdraws the elicitation once pi's dialog timeout has passed", async () => {
+		const { client: eliciting, sessionId, done } = await clientWith({ elicitation: { form: {} } });
+		try {
+			eliciting.elicitationAnswer = "never";
+			await eliciting.prompt({ sessionId, prompt: [{ type: "text", text: "SELECTSLOW please" }] });
+			expect(eliciting.agentText()).toContain("timed out");
+			await vi.waitFor(() => expect(eliciting.cancelledRequests).toHaveLength(1));
+		} finally {
+			done();
+		}
+	});
+
+	it("keeps the permission-prompt and cancel fallbacks for clients without elicitation", async () => {
+		const { sessionId } = await newSession();
+		client.permissionAnswer = "1";
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "SELECT please" }] });
+		expect(client.permissionRequests[0]?.options.map((o) => o.name)).toEqual(["red", "green"]);
+		expect(client.agentText()).toContain("answer: green");
+
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "INPUT please" }] });
+		expect(client.elicitationRequests).toHaveLength(0);
+		expect(client.agentText()).toContain('A pi extension asked for text input ("Your name?")');
+		expect(client.agentText()).toContain("cancelled");
+	});
+});
+
+describe("notices", () => {
+	it("sends pi's status messages as notices to a client that supports them", async () => {
+		const { client: noticing, sessionId, done } = await clientWith({ session: { notices: {} } });
+		try {
+			await noticing.prompt({ sessionId, prompt: [{ type: "text", text: "NOTIFY me" }] });
+			await noticing.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
+
+			const notices = noticing.updates.filter((u) => u.sessionUpdate === "notice");
+			expect(notices).toEqual([
+				{ sessionUpdate: "notice", severity: "warning", title: "heads up" },
+				{
+					sessionUpdate: "notice",
+					severity: "warning",
+					title: "Retrying after error (attempt 1/3, waiting 2s)",
+					description: "Overloaded",
+				},
+				{ sessionUpdate: "notice", severity: "info", title: "Retry succeeded on attempt 2." },
+			]);
+			// Notices replace the italic status lines rather than doubling them.
+			expect(noticing.agentText()).not.toContain("heads up");
+			expect(noticing.agentText()).not.toContain("Retrying");
+		} finally {
+			done();
+		}
+	});
+
+	it("falls back to status lines in the agent message otherwise", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
+		expect(client.updates.some((u) => u.sessionUpdate === "notice")).toBe(false);
+		expect(client.agentText()).toContain("_⚠ Retrying after error (attempt 1/3, waiting 2s): Overloaded_");
+	});
+});
+
+describe("compaction", () => {
+	const compactionUpdates = (updates: typeof client.updates) =>
+		updates.filter((u) => u.sessionUpdate === "compaction_update");
+
+	it("tracks a compaction as one entity for a client that supports it", async () => {
+		const { client: tracking, sessionId, done } = await clientWith({ session: { compaction: {} } });
+		try {
+			await tracking.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACT please" }] });
+			await tracking.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACTFAIL please" }] });
+			expect(compactionUpdates(tracking.updates)).toEqual([
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-1", status: "in_progress" },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: "pi-compaction-1",
+					status: "completed",
+					summary: [{ type: "text", text: "Summary of the earlier conversation." }],
+				},
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-2", status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-2", status: "failed", error: "model refused" },
+			]);
+			expect(tracking.agentText()).not.toContain("Compact");
+
+			// session/load shows where the stored compaction happened.
+			const before = tracking.updates.length;
+			await tracking.loadSession({ sessionId, cwd: tracking.workspace, mcpServers: [] });
+			expect(compactionUpdates(tracking.updates.slice(before))).toEqual([
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: "pi-compaction-1",
+					status: "completed",
+					summary: [{ type: "text", text: "Summary of the earlier conversation." }],
+				},
+			]);
+		} finally {
+			done();
+		}
+	});
+
+	it("reports compaction as status lines otherwise, and does not replay summaries", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACT please" }] });
+		expect(compactionUpdates(client.updates)).toEqual([]);
+		expect(client.agentText()).toContain("Context compacted (~1000 → ~200 tokens).");
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+		expect(compactionUpdates(client.updates.slice(before))).toEqual([]);
+		expect(client.agentText()).not.toContain("Summary of the earlier conversation.");
+	});
+});
+
+describe("session titles", () => {
+	const titles = (updates: typeof client.updates) =>
+		updates.flatMap((u) => (u.sessionUpdate === "session_info_update" ? [u.title] : []));
+
+	it("says nothing about an unnamed session", async () => {
+		await newSession();
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "available_commands_update"));
+		expect(titles(client.updates)).toEqual([]);
+	});
+
+	it("follows pi's session name as it is set and cleared", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "RENAME please" }] });
+		expect(titles(client.updates)).toEqual(["Renamed session"]);
+
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "UNNAME please" }] });
+		expect(titles(client.updates)).toEqual(["Renamed session", null]);
+	});
+
+	it("reports a name pi already has when the session opens", async () => {
+		const { client: named, workspace: dir, cleanup: done } = createTestClient({ extraArgs: ["--", "--name", "My chat"] });
+		try {
+			await named.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const { sessionId } = await named.newSession({ cwd: dir, mcpServers: [] });
+			// Nothing about the session may reach the client before the response does.
+			expect(named.updates).toEqual([]);
+			await named.waitFor((updates) => titles(updates).length > 0);
+			expect(titles(named.updates)).toEqual(["My chat"]);
+
+			await named.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+			await named.loadSession({ sessionId, cwd: dir, mcpServers: [] });
+			expect(titles(named.updates)).toEqual(["My chat", "My chat"]);
+		} finally {
+			done();
+		}
+	});
+});
+
+describe("session/list and session/delete", () => {
+	it("lists pi's stored sessions and deletes one", async () => {
+		// A pi-format session store, and a `trash` that only deletes, so the test
+		// never touches the machine's real trash.
+		const store = path.join(workspace, "store");
+		const bin = path.join(workspace, "bin");
+		mkdirSync(store);
+		mkdirSync(bin);
+		writeFileSync(path.join(bin, "trash"), '#!/bin/sh\nrm -- "$1"\n');
+		chmodSync(path.join(bin, "trash"), 0o755);
+		const file = path.join(store, "2026_abc.jsonl");
+		writeFileSync(
+			file,
+			[
+				{ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00.000Z", cwd: workspace },
+				{ type: "session_info", id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", name: "Stored chat" },
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n"),
+		);
+
+		const { client: lister, cleanup: done } = createTestClient({
+			extraArgs: ["--session-dir", store],
+			env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+		});
+		try {
+			await lister.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const listed = await lister.request<{ sessions: unknown[] }>("session/list", { cwd: workspace });
+			expect(listed.sessions).toEqual([
+				{ sessionId: file, cwd: workspace, title: "Stored chat", updatedAt: "2026-01-01T00:00:00.000Z" },
+			]);
+
+			await lister.request("session/delete", { sessionId: file });
+			expect(existsSync(file)).toBe(false);
+			expect((await lister.request<{ sessions: unknown[] }>("session/list", {})).sessions).toEqual([]);
+
+			// Deleting is limited to pi's session files.
+			await expect(lister.request("session/delete", { sessionId: path.join(workspace, "x.jsonl") })).rejects.toMatchObject({
+				code: -32002,
+			});
+		} finally {
+			done();
+		}
+	});
+
+	it("rejects a malformed cursor", async () => {
+		await expect(client.request("session/list", { cursor: "not-a-cursor" })).rejects.toMatchObject({ code: -32602 });
+	});
+});
+
+describe("session/resume", () => {
+	it("reopens a stored session without replaying it", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+
+		const before = client.updates.length;
+		const resumed = await client.request<{ configOptions: unknown[] }>("session/resume", {
+			sessionId,
+			cwd: workspace,
+			mcpServers: [],
+		});
+		expect(configOption(resumed.configOptions, "model").currentValue).toBe("anthropic/claude-sonnet-4");
+
+		// Commands still arrive, but none of the transcript does.
+		await client.waitFor((updates) =>
+			updates.slice(before).some((u) => u.sessionUpdate === "available_commands_update"),
+		);
+		const replayed = client.updates.slice(before);
+		expect(replayed.some((u) => u.sessionUpdate === "user_message_chunk")).toBe(false);
+		expect(replayed.some((u) => u.sessionUpdate === "agent_message_chunk")).toBe(false);
+
+		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT again" }] });
+		expect(response.stopReason).toBe("end_turn");
+	});
+});
+
+describe("session/close", () => {
+	it("stops the session so it no longer accepts prompts", async () => {
+		const { sessionId } = await newSession();
+		await client.request("session/close", { sessionId });
+		await expect(client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT" }] })).rejects.toMatchObject({
+			code: -32002,
+		});
+	});
+
+	it("ends a running turn as cancelled", async () => {
+		const { sessionId } = await newSession();
+		const pending = client.prompt({ sessionId, prompt: [{ type: "text", text: "SLOW please" }] });
+		await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "agent_message_chunk"));
+		await client.request("session/close", { sessionId });
+		await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
+	});
+
+	it("rejects an unknown session", async () => {
+		await expect(client.request("session/close", { sessionId: "nope" })).rejects.toMatchObject({ code: -32002 });
 	});
 });
 

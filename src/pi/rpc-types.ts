@@ -373,7 +373,17 @@ export type PiRpcResponse =
 // Events (pi -> adapter, stdout)
 // ============================================================================
 
+/**
+ * The `assistantMessageEvent` of a `message_update`, in its wire form (no
+ * cumulative `partial` snapshots).
+ *
+ * pi's agent loop turns the provider-level `start`, `done` and `error` events
+ * into `message_start` / `message_end`, but the wire type still admits them.
+ */
 export type PiAssistantMessageEvent =
+	| { type: "start" }
+	| { type: "done"; reason: "stop" | "length" | "toolUse" | "deferred"; message: PiAssistantMessage }
+	| { type: "error"; reason: "error" | "aborted"; error: PiAssistantMessage }
 	| { type: "text_start"; contentIndex: number }
 	| { type: "text_delta"; contentIndex: number; delta: string }
 	| { type: "text_end"; contentIndex: number; content: string }
