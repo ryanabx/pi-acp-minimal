@@ -23,8 +23,30 @@ jobs:
       - run: npm ci --ignore-scripts
 
       - run: npm run check
+      # Includes ACP conformance: every test's traffic is checked against the
+      # ACP v1 schema and protocol rules (test/conformance/).
       - run: npm test
       - run: npm run check:package
+
+  # src/pi/rpc-types.ts is a hand-written mirror of pi's RPC protocol. Compare
+  # it with the types of the pi release pinned in test/pi-protocol/. That
+  # package has its own lockfile so pi's dependency tree stays out of the
+  # adapter's (installing from git installs devDependencies); nothing from it
+  # runs, since tsc only reads its declaration files.
+  pi-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            npm-shrinkwrap.json
+            test/pi-protocol/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts --prefix test/pi-protocol
+      - run: npm run check:pi-protocol
 
   audit:
     runs-on: ubuntu-latest

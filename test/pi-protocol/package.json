@@ -1,0 +1,9 @@
+{
+	"name": "pi-acp-minimal-pi-protocol-check",
+	"private": true,
+	"type": "module",
+	"description": "pi's published types, used only by `npm run check:pi-protocol` to compare src/pi/rpc-types.ts with the real pi protocol. Kept out of the root package so installing the adapter from git does not pull pi's dependency tree.",
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "1.5.0"
+	}
+}

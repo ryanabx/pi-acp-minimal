@@ -398,12 +398,46 @@ npm run check         # typecheck + dependency policy
 npm test              # unit + end-to-end tests against a mock pi
 npm run build         # emit dist/
 npm run check:package # verify the published tarball
+npm run check:pi-protocol # rpc-types.ts against pi's types (see Conformance)
 ```
 
 `test/mock-pi.mjs` is a scripted stand-in for `pi --mode rpc`. Scenarios are
 selected by a marker in the prompt text (`TEXT`, `EDIT`, `BASH`, `CONFIRM`,
 `SLOW`, `RETRY`, …), which keeps the end-to-end tests deterministic and free of
 any provider dependency.
+
+### Conformance
+
+There is no official ACP conformance suite, so the adapter checks itself against
+the two protocols it sits between:
+
+- **ACP.** Every test client runs a `ConformanceMonitor`
+  ([`test/conformance/`](test/conformance/)) over its connection. It validates
+  every frame, in both directions, against the official ACP v1 JSON schema
+  shipped with the SDK, choosing the definition for each payload's method, and
+  checks the rules a schema cannot express: JSON-RPC framing and response
+  bookkeeping, nothing before `initialize`, no updates for sessions the client
+  does not know yet or has closed, features such as notices, compaction updates
+  and elicitation only when the client advertised them, and tool call updates
+  only for announced tool calls. Any violation fails the test, so the whole
+  suite doubles as a conformance suite. `test/conformance.test.ts` proves each
+  rule fires and sweeps every mock scenario for a client that advertises
+  nothing and one that advertises everything.
+- **pi.** `npm run check:pi-protocol` compiles
+  [`test/pi-protocol/check.ts`](test/pi-protocol/check.ts), which compares the
+  hand-written mirror in `src/pi/rpc-types.ts` with the published types of the
+  pi release pinned in `test/pi-protocol/package.json`: everything pi sends must
+  fit the mirror, everything the adapter sends must fit pi, and neither side may
+  use fields the other does not define. It needs that package installed first:
+
+  ```bash
+  npm ci --ignore-scripts --prefix test/pi-protocol
+  npm run check:pi-protocol
+  ```
+
+  To track a new pi release, bump the version there, run
+  `npm install --ignore-scripts --prefix test/pi-protocol`, and fix what the
+  check reports.
 
 To also run smoke tests against a real pi install (handshake, session setup and
 a live cancel — no model provider needed):

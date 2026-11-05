@@ -1,0 +1,12 @@
+{
+	"extends": "../../tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "../..",
+		"noEmit": true,
+		"declaration": false,
+		"sourceMap": false,
+		"allowImportingTsExtensions": true,
+		"types": ["node"]
+	},
+	"include": ["check.ts"]
+}
