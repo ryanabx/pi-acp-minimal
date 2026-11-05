@@ -6,7 +6,7 @@
  * adapter can be exercised end to end without a provider or an LLM. The prompt
  * text selects the scenario; see `scenarios` below.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -40,6 +40,14 @@ const models = [
 const resumeIndex = process.argv.indexOf("--session");
 if (resumeIndex !== -1 && process.argv[resumeIndex + 1]) {
 	state.sessionFile = process.argv[resumeIndex + 1];
+}
+
+/** MOCK_PI_RECORD: append how this pi was started, for tests that check the launch. */
+if (process.env.MOCK_PI_RECORD) {
+	appendFileSync(
+		process.env.MOCK_PI_RECORD,
+		`${JSON.stringify({ argv: process.argv.slice(2), mcpServers: process.env.PI_ACP_MCP_SERVERS ?? null })}\n`,
+	);
 }
 
 const messages = existsSync(state.sessionFile) ? JSON.parse(readFileSync(state.sessionFile, "utf8")) : [];

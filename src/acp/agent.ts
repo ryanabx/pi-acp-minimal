@@ -12,6 +12,7 @@ import {
 	type InitializeResponse,
 	type ListSessionsRequest,
 	type ListSessionsResponse,
+	type McpServer,
 	type LoadSessionRequest,
 	type LoadSessionResponse,
 	methods,
@@ -28,6 +29,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { isThinkingLevel, MODEL_CONFIG_ID, THINKING_CONFIG_ID } from "../map/config.js";
 import { toPiPrompt } from "../map/content.js";
+import { toPiMcpServers } from "../map/mcp.js";
 import { PiRpcError } from "../pi/rpc-client.js";
 import { PiSessionStore } from "../pi/session-store.js";
 import { authRequired, internalError, invalidParams, resourceNotFound } from "./errors.js";
@@ -114,6 +116,9 @@ export class PiAcpAgent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { image: true, embeddedContext: true, audio: false },
+				// Client-supplied servers are registered through a pi extension;
+				// pi speaks stdio and streamable HTTP, not the legacy SSE transport.
+				mcpCapabilities: { http: true, sse: false },
 				sessionCapabilities: { list: {}, delete: {}, resume: {}, close: {} },
 			},
 			// pi manages provider credentials itself (`pi auth login`), so there is
@@ -127,8 +132,7 @@ export class PiAcpAgent {
 	}
 
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-		this.#warnAboutMcpServers(params.mcpServers?.length ?? 0);
-		const session = await this.#startSession(params.cwd);
+		const session = await this.#startSession(params.cwd, { mcpServers: params.mcpServers });
 		// Commands are published only after this response is on the wire: a client
 		// cannot route a session/update for a session it has not been told about yet.
 		session.publishSessionStateSoon();
@@ -193,9 +197,8 @@ export class PiAcpAgent {
 	async #openStoredSession(params: {
 		sessionId: string;
 		cwd: string;
-		mcpServers?: unknown[] | undefined;
+		mcpServers?: McpServer[] | undefined;
 	}): Promise<PiSession> {
-		this.#warnAboutMcpServers(params.mcpServers?.length ?? 0);
 		if (params.sessionId.startsWith(UNPERSISTED_SESSION_PREFIX)) {
 			throw invalidParams("This session was created without persistence and cannot be reopened");
 		}
@@ -204,7 +207,10 @@ export class PiAcpAgent {
 		this.#sessions.delete(params.sessionId);
 		await running?.close();
 
-		const session = await this.#startSession(params.cwd, params.sessionId);
+		const session = await this.#startSession(params.cwd, {
+			resumeSessionFile: params.sessionId,
+			mcpServers: params.mcpServers,
+		});
 		if (session.sessionId !== params.sessionId) {
 			// pi resolved `--session` to a different file; the client only knows the
 			// id it asked for, so keep that one authoritative everywhere.
@@ -269,7 +275,10 @@ export class PiAcpAgent {
 		await Promise.all(sessions.map((session) => session.close()));
 	}
 
-	async #startSession(cwd: string, resumeSessionFile?: string): Promise<PiSession> {
+	async #startSession(
+		cwd: string,
+		{ resumeSessionFile, mcpServers = [] }: { resumeSessionFile?: string; mcpServers?: McpServer[] | undefined } = {},
+	): Promise<PiSession> {
 		const session = new PiSession({
 			client: this.#client,
 			clientCapabilities: this.#clientCapabilities,
@@ -278,6 +287,7 @@ export class PiAcpAgent {
 			piArgs: this.#options.piArgs,
 			env: this.#options.env,
 			resumeSessionFile,
+			mcpServers: toPiMcpServers(mcpServers, this.#options.log),
 			log: this.#options.log,
 		});
 
@@ -298,13 +308,6 @@ export class PiAcpAgent {
 		return session;
 	}
 
-	#warnAboutMcpServers(count: number): void {
-		if (count > 0) {
-			this.#options.log(
-				`ignoring ${count} client-supplied MCP server(s): pi loads MCP servers from its own settings, not from ACP`,
-			);
-		}
-	}
 }
 
 const LIST_PAGE_SIZE = 100;

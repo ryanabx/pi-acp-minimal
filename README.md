@@ -124,7 +124,7 @@ even where a mapping step has to await the file system.
 | ACP | pi RPC |
 |---|---|
 | `initialize` | — (capability negotiation only) |
-| `session/new` | spawn `pi --mode rpc` in `cwd`, then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
+| `session/new` | spawn `pi --mode rpc` in `cwd` (plus the MCP extension when the client supplies servers), then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
 | `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates (stored compaction summaries as completed `compaction_update`s, for clients that track compactions) |
 | `session/resume` | spawn `pi --mode rpc --session <file>`, no replay |
 | `session/close` | `abort` if a turn is running, then stop the pi process |
@@ -245,6 +245,28 @@ pi's extension commands, prompt templates and skills are published as ACP
 can register commands at runtime). ACP clients send the chosen command back as
 plain `/name args` text, which is exactly what pi's `prompt` already expands.
 
+### MCP servers
+
+pi has no command-line flag or RPC command for adding MCP servers, but its
+extensions can register them for a session (`pi.registerMcpServer`). When a
+client supplies servers in `session/new`, `session/load` or `session/resume`,
+the adapter starts that session's pi with a small bundled extension
+([`pi-extension/acp-mcp-servers.js`](pi-extension/acp-mcp-servers.js)) that
+registers them; sessions without client servers start pi exactly as before.
+
+- stdio servers map to pi's `command`/`args`/`env`, HTTP servers to `url`/`headers`.
+- Server names are made valid for pi (letters, digits, `_`, `-`) and unique.
+  A server of the same name in pi's own `mcp.json` takes precedence, as pi
+  documents for extension-registered servers.
+- `env` and header values are escaped so pi uses them literally rather than
+  expanding `$VAR` or running `!command`. pi still expands a leading `~` in
+  `command` and `args`.
+- The servers reach the extension in an environment variable that it deletes
+  as it loads, so commands run by pi's tools cannot read header or env
+  credentials from it.
+- `--no-mcp`, or an extension that replaces pi's built-in MCP support, means the
+  servers are not connected; pi reports that as an extension error.
+
 ### Extension dialogs
 
 pi has no built-in permission system — it runs with the privileges of the user
@@ -268,8 +290,9 @@ once pi has stopped waiting for it.
 
 ## Known limitations
 
-- **MCP servers** supplied by the client in `session/new` are ignored, with a
-  warning on stderr. pi loads MCP servers from its own settings.
+- **MCP over SSE.** pi only speaks stdio and streamable HTTP to MCP servers, so
+  client-supplied SSE servers are skipped with a warning (and
+  `mcpCapabilities.sse` is not advertised).
 - **Terminals.** pi runs shell commands itself, so `terminal/*` is not used;
   `bash` output is streamed as tool call content instead.
 - **Plans.** pi has no todo/plan tool, so no `plan` updates are emitted.

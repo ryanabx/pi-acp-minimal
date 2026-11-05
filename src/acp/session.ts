@@ -15,10 +15,12 @@ import {
 	type ToolCallStatus,
 	type ToolKind,
 } from "@agentclientprotocol/sdk";
+import { fileURLToPath } from "node:url";
 import { toAcpCommand } from "../map/commands.js";
 import { assistantText, toAcpContentBlocks } from "../map/content.js";
 import { buildConfigOptions } from "../map/config.js";
 import { fromAcpModelId, toAcpModelId } from "../map/models.js";
+import type { PiMcpServerConfig } from "../map/mcp.js";
 import { isFileMutatingTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
 import { toAcpUsageUpdate } from "../map/usage.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
@@ -51,6 +53,8 @@ export interface PiSessionOptions {
 	env?: NodeJS.ProcessEnv;
 	/** Existing pi session file to resume, for `session/load`. */
 	resumeSessionFile?: string;
+	/** MCP servers the client supplied, in pi's format, keyed by server name. */
+	mcpServers?: Record<string, PiMcpServerConfig>;
 	log: (message: string) => void;
 }
 
@@ -66,6 +70,9 @@ interface ToolCallState {
 	filePath?: string;
 	announced: boolean;
 }
+
+/** The pi extension that registers client-supplied MCP servers; see the file for why. */
+const MCP_EXTENSION = fileURLToPath(new URL("../../pi-extension/acp-mcp-servers.js", import.meta.url));
 
 /** Session id prefix used when pi runs without session persistence. */
 export const UNPERSISTED_SESSION_PREFIX = "pi-session:";
@@ -147,11 +154,19 @@ export class PiSession {
 		const args = [...options.piArgs];
 		if (options.resumeSessionFile) args.push("--session", options.resumeSessionFile);
 
+		let env = options.env;
+		if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
+			// The extension reads the servers and removes the variable before any
+			// tool runs, so header and env values never reach the commands pi runs.
+			args.push("-e", MCP_EXTENSION);
+			env = { ...(options.env ?? process.env), PI_ACP_MCP_SERVERS: JSON.stringify(options.mcpServers) };
+		}
+
 		this.#client = new PiRpcClient({
 			command: options.piCommand,
 			args,
 			cwd: options.cwd,
-			env: options.env,
+			env,
 			onEvent: (event) => this.#enqueue(() => this.#handleEvent(event)),
 			onExtensionUiRequest: (request) => this.#enqueue(() => this.#handleExtensionUi(request)),
 			onStderr: (chunk) => this.#log(chunk.trimEnd()),
