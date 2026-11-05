@@ -523,7 +523,7 @@ export class PiSession {
 				return this.publishUsage();
 
 			case "agent_settled":
-				return this.#settleTurn();
+				return this.#settleTurn(event.aborted === true);
 
 			case "compaction_start":
 				return this.#status(`Compacting context (${event.reason})…`);
@@ -757,13 +757,16 @@ export class PiSession {
 		this.#enqueue(() => this.#settleTurn());
 	}
 
-	async #settleTurn(): Promise<void> {
+	async #settleTurn(aborted = false): Promise<void> {
 		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;
 
-		if (this.#cancelled) return turn.resolve("cancelled");
+		// pi reports an aborted run on agent_settled; that is authoritative where
+		// the last assistant stop reason is not, for example an abort while a tool
+		// was still running, which leaves the previous "toolUse" reason behind.
+		if (this.#cancelled || aborted) return turn.resolve("cancelled");
 
 		const stopReason = this.#lastStopReason;
 		if (stopReason === "error") {

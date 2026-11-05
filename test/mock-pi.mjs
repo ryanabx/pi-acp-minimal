@@ -97,6 +97,7 @@ const scenarios = [
 	{ match: /\bCONFIRM\b/, run: confirmScenario },
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
+	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
@@ -273,6 +274,22 @@ async function noStatsScenario() {
 /** A prompt handled entirely by an extension: no agent run at all. */
 async function noopScenario() {
 	return "no-agent-run";
+}
+
+/**
+ * pi aborts the run itself while a tool is still running.
+ *
+ * The assistant message already ended with "toolUse", so only the `aborted`
+ * flag on `agent_settled` tells the client the turn did not complete.
+ */
+async function selfAbortScenario() {
+	const args = { command: "sleep 10" };
+	startAssistant();
+	delta({ type: "toolcall_start", contentIndex: 0, id: "call-slow", toolName: "bash" });
+	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-slow", name: "bash", arguments: args } });
+	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
+	aborted = true;
+	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
 }
 
 // ============================================================================

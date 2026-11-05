@@ -220,6 +220,17 @@ describe("session/cancel", () => {
 		client.cancel(sessionId);
 		await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
 	});
+
+	it("reports a pi-initiated abort as a cancelled turn", async () => {
+		const { sessionId } = await newSession();
+		// pi aborts while a tool is running: the last assistant message ended
+		// with "toolUse", so only agent_settled.aborted marks the turn aborted.
+		const response = await client.prompt({
+			sessionId,
+			prompt: [{ type: "text", text: "SELFABORT now" }],
+		});
+		expect(response.stopReason).toBe("cancelled");
+	});
 });
 
 describe("session/set_config_option", () => {
