@@ -95,8 +95,11 @@ const scenarios = [
 	{ match: /\bRETRY\b/, run: retryScenario },
 	{ match: /\bSLOW\b/, run: slowScenario },
 	{ match: /\bCONFIRM\b/, run: confirmScenario },
+	{ match: /\bNESTED\b/, run: nestedScenario },
 	{ match: /\bNOTIFY\b/, run: notifyScenario },
 	{ match: /\bNOOP\b/, run: noopScenario },
+	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
+	{ match: /\bLEVELCHANGE\b/, run: levelChangeScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
@@ -107,6 +110,14 @@ function startAssistant() {
 		type: "message_start",
 		message: { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4", usage, timestamp: Date.now() },
 	});
+}
+
+/** pi 1.x reports a per-input disposition on the prompt response. */
+function promptDisposition(message) {
+	// MOCK_PI_NO_DISPOSITION mimics an older pi that sends no response data.
+	if (process.env.MOCK_PI_NO_DISPOSITION === "1") return undefined;
+	// The NOOP scenario is an extension command that consumes the prompt inline.
+	return { disposition: /\bNOOP\b/.test(message) ? "handled" : "started" };
 }
 
 function endAssistant(content, stopReason, errorMessage) {
@@ -190,6 +201,7 @@ async function bashScenario() {
 		toolName: "bash",
 		result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 } },
 		isError: false,
+		durationMs: 42,
 	});
 	endAssistant([{ type: "toolCall", id: "call-bash", name: "bash", arguments: args }], "toolUse");
 }
@@ -246,6 +258,41 @@ async function confirmScenario() {
 	endAssistant([{ type: "text", text }], "stop");
 }
 
+/**
+ * A tool calls another tool through `ctx.executeTool()`, then asks for
+ * confirmation. pi tags the nested call's events with `parentToolCallId`.
+ */
+async function nestedScenario() {
+	const outerArgs = { command: "deploy" };
+	const innerArgs = { path: "config.json" };
+	startAssistant();
+	delta({ type: "toolcall_start", contentIndex: 0, id: "call-outer", toolName: "bash" });
+	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-outer", name: "bash", arguments: outerArgs } });
+	endAssistant([{ type: "toolCall", id: "call-outer", name: "bash", arguments: outerArgs }], "toolUse");
+	write({ type: "tool_execution_start", toolCallId: "call-outer", toolName: "bash", args: outerArgs });
+	write({ type: "tool_execution_start", toolCallId: "call-inner", toolName: "read", args: innerArgs, parentToolCallId: "call-outer" });
+	write({
+		type: "tool_execution_end",
+		toolCallId: "call-inner",
+		toolName: "read",
+		result: { content: [{ type: "text", text: "{}" }], details: {} },
+		isError: false,
+		durationMs: 1,
+		parentToolCallId: "call-outer",
+	});
+	write({ type: "extension_ui_request", id: "ui-3", method: "confirm", title: "Deploy?", message: "to production" });
+	await waitForUiResponse("ui-3");
+	write({
+		type: "tool_execution_end",
+		toolCallId: "call-outer",
+		toolName: "bash",
+		result: { content: [{ type: "text", text: "deployed" }], details: {} },
+		isError: false,
+		durationMs: 5,
+	});
+	await textScenario();
+}
+
 async function notifyScenario() {
 	write({ type: "extension_ui_request", id: "ui-2", method: "notify", message: "heads up", notifyType: "warning" });
 	await textScenario();
@@ -266,6 +313,29 @@ async function noStatsScenario() {
 /** A prompt handled entirely by an extension: no agent run at all. */
 async function noopScenario() {
 	return "no-agent-run";
+}
+
+/**
+ * pi aborts the run itself while a tool is still running.
+ *
+ * The assistant message already ended with "toolUse", so only the `aborted`
+ * flag on `agent_settled` tells the client the turn did not complete.
+ */
+async function selfAbortScenario() {
+	const args = { command: "sleep 10" };
+	startAssistant();
+	delta({ type: "toolcall_start", contentIndex: 0, id: "call-slow", toolName: "bash" });
+	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-slow", name: "bash", arguments: args } });
+	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
+	aborted = true;
+	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
+}
+
+/** An extension moves the thinking level mid-run, as pi 1.x reports it. */
+async function levelChangeScenario() {
+	state.thinkingLevel = "medium";
+	write({ type: "thinking_level_changed", level: "medium" });
+	await textScenario();
 }
 
 // ============================================================================
@@ -297,7 +367,7 @@ async function runPrompt(message) {
 	write({ type: "agent_end", messages: [], willRetry: false });
 	state.isStreaming = false;
 	persist();
-	write({ type: "agent_settled" });
+	write({ type: "agent_settled", aborted });
 }
 
 function success(id, command, data) {
@@ -364,7 +434,7 @@ async function handleCommand(command) {
 			return success(id, type);
 		case "prompt": {
 			state.isStreaming = true;
-			success(id, type);
+			success(id, type, promptDisposition(command.message));
 			void runPrompt(command.message).catch((error) => {
 				process.stderr.write(`mock-pi scenario failed: ${error?.stack ?? error}\n`);
 			});

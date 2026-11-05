@@ -24,6 +24,7 @@ import type {
 	PiImageContent,
 	PiMessage,
 	PiModel,
+	PiPromptDisposition,
 	PiRpcEvent,
 	PiSessionState,
 	PiStopReason,
@@ -76,6 +77,11 @@ const STOP_REASONS: Record<PiStopReason, PromptStopReason | undefined> = {
 	length: "max_tokens",
 	aborted: "cancelled",
 	error: undefined,
+	// Defensive: `pending` never reaches `message_end`, and a `deferred`
+	// response's final content is fetched out of band, so both end the turn
+	// as far as the client is concerned.
+	pending: "end_turn",
+	deferred: "end_turn",
 };
 
 /**
@@ -103,6 +109,8 @@ export class PiSession {
 	#turn: { resolve: (reason: PromptStopReason) => void; reject: (error: Error) => void } | null = null;
 	#cancelled = false;
 	#sawAgentRun = false;
+	/** What pi reported it did with the current prompt, if anything yet. */
+	#promptDisposition: PiPromptDisposition | undefined;
 	#idleWatchdog: NodeJS.Timeout | null = null;
 	#idleObservations = 0;
 	#lastStopReason: PiStopReason | undefined;
@@ -342,6 +350,7 @@ export class PiSession {
 
 		this.#cancelled = false;
 		this.#sawAgentRun = false;
+		this.#promptDisposition = undefined;
 		this.#lastStopReason = undefined;
 		this.#lastErrorMessage = undefined;
 		this.#toolCalls.clear();
@@ -352,13 +361,29 @@ export class PiSession {
 		});
 
 		try {
-			await this.#client.request({ type: "prompt", message, images: images.length > 0 ? images : undefined });
+			const response = await this.#client.request({
+				type: "prompt",
+				message,
+				images: images.length > 0 ? images : undefined,
+			});
+			// Older pi builds send no `data` on the prompt response.
+			this.#promptDisposition = response?.disposition;
 		} catch (error) {
 			this.#turn = null;
 			throw internalError(errorMessage(error));
 		}
 
-		this.#startIdleWatchdog();
+		if (this.#promptDisposition === "handled" && !this.#sawAgentRun) {
+			// An extension command or input handler consumed the prompt: pi will
+			// not start a run for it, so there is no agent_settled to wait for.
+			// Queue behind events pi already sent so their updates land first.
+			this.#log('pi reported the prompt "handled" without an agent run; ending turn');
+			this.#enqueue(() => this.#settleTurn());
+		} else {
+			// "started" and "queued" end on agent_settled. The watchdog covers pi
+			// builds that do not report a disposition.
+			this.#startIdleWatchdog();
+		}
 		const stopReason = await settled;
 		await this.publishCommands();
 		await this.publishConfigOptions();
@@ -456,6 +481,22 @@ export class PiSession {
 				await this.#notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
 				return;
 			}
+
+			case "custom": {
+				// Extension context message. pi shows these only when `display` is
+				// true and converts them to a user message for the model.
+				if (!message.display) return;
+				for (const content of toAcpContentBlocks(message.content)) {
+					await this.#notify({ sessionUpdate: "user_message_chunk", content });
+				}
+				return;
+			}
+
+			default:
+				// system, branchSummary and compactionSummary are model context, not
+				// transcript: pi sends them in get_messages but they are not part of
+				// the conversation a client wants reloaded.
+				return;
 		}
 	}
 
@@ -488,7 +529,7 @@ export class PiSession {
 				return this.#handleMessageEnd(event.message);
 
 			case "tool_execution_start":
-				return this.#handleToolStart(event.toolCallId, event.toolName, event.args);
+				return this.#handleToolStart(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
 
 			case "tool_execution_update":
 				return this.#handleToolUpdate(event.toolCallId, event.partialResult);
@@ -502,7 +543,7 @@ export class PiSession {
 				return this.publishUsage();
 
 			case "agent_settled":
-				return this.#settleTurn();
+				return this.#settleTurn(event.aborted === true);
 
 			case "compaction_start":
 				return this.#status(`Compacting context (${event.reason})…`);
@@ -515,6 +556,12 @@ export class PiSession {
 				const detail = before && after ? ` (~${before} → ~${after} tokens)` : "";
 				return this.#status(`Context compacted${detail}.`);
 			}
+
+			case "thinking_level_changed":
+				// pi's level can move without a prompt from us (an extension or a
+				// model switch can change it); re-read pi's state and let the client
+				// know now instead of at the next turn's end.
+				return this.publishConfigOptions();
 
 			case "auto_retry_start":
 				return this.#status(
@@ -647,8 +694,16 @@ export class PiSession {
 		});
 	}
 
-	async #handleToolStart(toolCallId: string, toolName: string, args: Record<string, unknown>): Promise<void> {
-		this.#activeToolCallId = toolCallId;
+	async #handleToolStart(
+		toolCallId: string,
+		toolName: string,
+		args: Record<string, unknown>,
+		parentToolCallId: string | undefined,
+	): Promise<void> {
+		// A call a tool makes through `ctx.executeTool()` still shows as its own
+		// tool call, but the calling tool stays the one a dialog belongs to:
+		// otherwise the nested call's end would leave no active tool call behind.
+		if (!parentToolCallId) this.#activeToolCallId = toolCallId;
 		await this.#describeToolCall(toolCallId, toolName, args, "in_progress");
 
 		// Snapshot the file before it changes so the completion can carry a real diff.
@@ -698,8 +753,11 @@ export class PiSession {
 	 *
 	 * Extension commands (`/mycommand`) are handled inline by pi and may finish
 	 * without emitting `agent_start`/`agent_settled`, which would leave
-	 * `session/prompt` pending forever. Poll pi until it has been idle for a
-	 * few consecutive checks, then end the turn ourselves.
+	 * `session/prompt` pending forever. pi reports these as a `"handled"`
+	 * disposition, which ends the turn directly; this is the fallback for pi
+	 * builds that report no disposition and for a reported run that never
+	 * materialises. Poll pi until it has been idle for a few consecutive
+	 * checks, then end the turn ourselves.
 	 */
 	#startIdleWatchdog(): void {
 		this.#stopIdleWatchdog();
@@ -732,17 +790,22 @@ export class PiSession {
 		if (++this.#idleObservations < IDLE_OBSERVATIONS_BEFORE_SETTLE) return;
 
 		this.#stopIdleWatchdog();
-		this.#log("prompt completed without an agent run (extension command); ending turn");
+		this.#log(
+			`prompt completed without an agent run (pi reported "${this.#promptDisposition ?? "unknown"}"); ending turn`,
+		);
 		this.#enqueue(() => this.#settleTurn());
 	}
 
-	async #settleTurn(): Promise<void> {
+	async #settleTurn(aborted = false): Promise<void> {
 		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;
 
-		if (this.#cancelled) return turn.resolve("cancelled");
+		// pi reports an aborted run on agent_settled; that is authoritative where
+		// the last assistant stop reason is not, for example an abort while a tool
+		// was still running, which leaves the previous "toolUse" reason behind.
+		if (this.#cancelled || aborted) return turn.resolve("cancelled");
 
 		const stopReason = this.#lastStopReason;
 		if (stopReason === "error") {

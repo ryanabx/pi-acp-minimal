@@ -130,6 +130,37 @@ describe("session/prompt", () => {
 		const { sessionId } = await newSession();
 		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "/NOOP" }] });
 		expect(response.stopReason).toBe("end_turn");
+		// pi reports the prompt "handled", which ends the turn without waiting
+		// for the idle watchdog.
+		const log = client.stderr.join("");
+		expect(log).toContain('pi reported the prompt "handled"');
+		expect(log).not.toContain("prompt completed without an agent run");
+	});
+
+	describe("with a pi that reports no prompt disposition", () => {
+		let old: TestClient;
+		let oldSession: string;
+		let oldDone: () => void;
+
+		beforeEach(async () => {
+			const created = createTestClient({ env: { MOCK_PI_NO_DISPOSITION: "1" } });
+			({ client: old, cleanup: oldDone } = created);
+			await old.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			({ sessionId: oldSession } = await old.newSession({ cwd: created.workspace, mcpServers: [] }));
+		});
+		afterEach(() => oldDone());
+
+		it("still runs prompts", async () => {
+			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "TEXT please" }] });
+			expect(response.stopReason).toBe("end_turn");
+			expect(old.agentText()).toContain("Hello, world!");
+		});
+
+		it("falls back to the idle watchdog for extension commands", async () => {
+			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "/NOOP" }] });
+			expect(response.stopReason).toBe("end_turn");
+			expect(old.stderr.join("")).toContain('prompt completed without an agent run (pi reported "unknown")');
+		});
 	});
 });
 
@@ -220,6 +251,17 @@ describe("session/cancel", () => {
 		client.cancel(sessionId);
 		await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
 	});
+
+	it("reports a pi-initiated abort as a cancelled turn", async () => {
+		const { sessionId } = await newSession();
+		// pi aborts while a tool is running: the last assistant message ended
+		// with "toolUse", so only agent_settled.aborted marks the turn aborted.
+		const response = await client.prompt({
+			sessionId,
+			prompt: [{ type: "text", text: "SELFABORT now" }],
+		});
+		expect(response.stopReason).toBe("cancelled");
+	});
 });
 
 describe("session/set_config_option", () => {
@@ -277,6 +319,26 @@ describe("session/set_config_option", () => {
 		expect(anthropic.description).toBe("anthropic · 99k context · reasoning");
 	});
 
+	it("updates the thinking control when pi changes the level mid-run", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "LEVELCHANGE please" }] });
+
+		const withMedium = client.updates.find((u) => {
+			if (u.sessionUpdate !== "config_option_update") return false;
+			try {
+				return configOption(u.configOptions, "thinking").currentValue === "medium";
+			} catch {
+				return false;
+			}
+		});
+		expect(withMedium).toBeDefined();
+
+		// The refresh arrives while the turn is running, not only at its end.
+		const updateIndex = client.updates.indexOf(withMedium!);
+		const firstTextIndex = client.updates.findIndex((u) => u.sessionUpdate === "agent_message_chunk");
+		expect(updateIndex).toBeLessThan(firstTextIndex);
+	});
+
 	it("does not re-announce config options that have not changed", async () => {
 		const { sessionId } = await newSession();
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
@@ -307,6 +369,18 @@ describe("extension UI bridge", () => {
 		client.permissionAnswer = "no";
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "CONFIRM this" }] });
 		expect(client.agentText()).toContain("declined");
+	});
+
+	it("attaches a dialog to the calling tool, not to a call it made", async () => {
+		const { sessionId } = await newSession();
+		client.permissionAnswer = "yes";
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "NESTED please" }] });
+
+		// The nested call is still visible as its own tool call...
+		expect(client.toolUpdates("call-inner").at(-1)).toMatchObject({ status: "completed" });
+		// ...but the confirm that follows it belongs to the outer tool.
+		expect(client.permissionRequests).toHaveLength(1);
+		expect(client.permissionRequests[0]!.toolCall.toolCallId).toBe("call-outer");
 	});
 
 	it("surfaces extension notifications as agent messages", async () => {
@@ -381,6 +455,36 @@ describe("session/load", () => {
 		expect(
 			replayed.some((u) => u.sessionUpdate === "agent_message_chunk" && u.content.type === "text" && u.content.text.includes("Hello, world!")),
 		).toBe(true);
+	});
+
+	it("replays displayable custom messages and skips model-context roles", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+
+		// Seed the stored transcript the way pi 1.x does: system messages and
+		// summaries are model context, custom messages are visible only when
+		// display is true.
+		const messages = JSON.parse(readFileSync(sessionId, "utf8"));
+		messages.push(
+			{ role: "system", content: "You are a coding agent.", timestamp: Date.now() },
+			{ role: "custom", customType: "note", content: "extension note", display: true, timestamp: Date.now() },
+			{ role: "custom", customType: "note", content: "hidden note", display: false, timestamp: Date.now() },
+			{ role: "branchSummary", summary: "branch summary", fromId: null, timestamp: Date.now() },
+		);
+		writeFileSync(sessionId, JSON.stringify(messages));
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+
+		const replayedText = client.updates
+			.slice(before)
+			.filter((u) => u.sessionUpdate === "user_message_chunk" && u.content.type === "text")
+			.map((u) => (u.sessionUpdate === "user_message_chunk" && u.content.type === "text" ? u.content.text : ""))
+			.join("");
+		expect(replayedText).toContain("extension note");
+		expect(replayedText).not.toContain("hidden note");
+		expect(replayedText).not.toContain("branch summary");
+		expect(replayedText).not.toContain("You are a coding agent.");
 	});
 });
 

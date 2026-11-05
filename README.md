@@ -5,7 +5,7 @@ An [Agent Client Protocol](https://agentclientprotocol.com) (ACP) adapter for
 Emacs, and friends.
 
 The adapter is a thin translation layer. It speaks ACP over stdio to the editor
-and pi's [RPC protocol](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/rpc.md)
+and pi's [RPC protocol](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
 over stdin/stdout to a `pi --mode rpc` child process, and its job is almost
 entirely a mapping from one set of types to the other.
 
@@ -60,8 +60,8 @@ Running from a local checkout instead:
   "agent_servers": {
     "pi": {
       "type": "custom",
-      "command": "node",
-      "args": ["/absolute/path/to/pi-acp-minimal/dist/cli.js"]
+      "command": "npx",
+      "args": ["/absolute/path/to/pi-acp-minimal/"]
     }
   }
 }
@@ -284,7 +284,7 @@ read in one sitting, and enforces it in CI.
 ```
 pi-acp-minimal
 └─┬ @agentclientprotocol/sdk@1.4.0   (the ACP protocol implementation)
-  └── zod@4.5.4                      (its schema validator, a peer dependency)
+  └── zod@4.6.7                      (its schema validator, a peer dependency)
 ```
 
 Neither declares an install lifecycle script, and both carry verified npm
