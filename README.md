@@ -5,7 +5,7 @@ An [Agent Client Protocol](https://agentclientprotocol.com) (ACP) adapter for
 Emacs, and friends.
 
 The adapter is a thin translation layer. It speaks ACP over stdio to the editor
-and pi's [RPC protocol](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/rpc.md)
+and pi's [RPC protocol](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
 over stdin/stdout to a `pi --mode rpc` child process, and its job is almost
 entirely a mapping from one set of types to the other.
 
