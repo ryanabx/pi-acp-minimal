@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -440,6 +440,56 @@ describe("usage reporting", () => {
 			.map((u) => (u.sessionUpdate === "usage_update" ? u.used : -1));
 		// Only the session-start report; the turn itself yielded nothing new.
 		expect(afterPrompt).toEqual([0]);
+	});
+});
+
+describe("session/list and session/delete", () => {
+	it("lists pi's stored sessions and deletes one", async () => {
+		// A pi-format session store, and a `trash` that only deletes, so the test
+		// never touches the machine's real trash.
+		const store = path.join(workspace, "store");
+		const bin = path.join(workspace, "bin");
+		mkdirSync(store);
+		mkdirSync(bin);
+		writeFileSync(path.join(bin, "trash"), '#!/bin/sh\nrm -- "$1"\n');
+		chmodSync(path.join(bin, "trash"), 0o755);
+		const file = path.join(store, "2026_abc.jsonl");
+		writeFileSync(
+			file,
+			[
+				{ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00.000Z", cwd: workspace },
+				{ type: "session_info", id: "e1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", name: "Stored chat" },
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n"),
+		);
+
+		const { client: lister, cleanup: done } = createTestClient({
+			extraArgs: ["--session-dir", store],
+			env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+		});
+		try {
+			await lister.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const listed = await lister.request<{ sessions: unknown[] }>("session/list", { cwd: workspace });
+			expect(listed.sessions).toEqual([
+				{ sessionId: file, cwd: workspace, title: "Stored chat", updatedAt: "2026-01-01T00:00:00.000Z" },
+			]);
+
+			await lister.request("session/delete", { sessionId: file });
+			expect(existsSync(file)).toBe(false);
+			expect((await lister.request<{ sessions: unknown[] }>("session/list", {})).sessions).toEqual([]);
+
+			// Deleting is limited to pi's session files.
+			await expect(lister.request("session/delete", { sessionId: path.join(workspace, "x.jsonl") })).rejects.toMatchObject({
+				code: -32002,
+			});
+		} finally {
+			done();
+		}
+	});
+
+	it("rejects a malformed cursor", async () => {
+		await expect(client.request("session/list", { cursor: "not-a-cursor" })).rejects.toMatchObject({ code: -32602 });
 	});
 });
 

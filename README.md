@@ -128,10 +128,23 @@ even where a mapping step has to await the file system.
 | `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates |
 | `session/resume` | spawn `pi --mode rpc --session <file>`, no replay |
 | `session/close` | `abort` if a turn is running, then stop the pi process |
+| `session/list` | read pi's session files (pi has no RPC command for it; see below) |
+| `session/delete` | delete a pi session file, through the `trash` CLI when installed, as pi's `/resume` picker does |
 | `session/prompt` | `prompt` |
 | `session/cancel` | `abort` |
 | `session/set_config_option` | `set_model` or `set_thinking_level` |
 | `authenticate` | — (pi owns its credentials; see below) |
+
+ACP session ids are pi session file paths, so `session/list` returns exactly
+what `session/load` and `session/resume` accept. Because pi's RPC protocol cannot
+list or delete sessions, the adapter reads pi's session store directly, using
+pi's own rules: `--session-dir` (passed through by `--session-dir` or after
+`--`), else `PI_CODING_AGENT_SESSION_DIR`, else `sessionDir` in pi's global
+`settings.json`, else the per-directory layout under `~/.pi/agent/sessions/`
+(or `PI_CODING_AGENT_DIR`). Titles are pi's session name, else the first user
+message, as in pi's session picker. A project-level `sessionDir` setting is not
+read, because pi only honours it in trusted projects. `session/delete` only
+deletes pi session files inside that store.
 
 ### pi RPC events → ACP `session/update`
 

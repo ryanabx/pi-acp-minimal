@@ -7,8 +7,11 @@ import {
 	type CancelNotification,
 	type ClientCapabilities,
 	type CloseSessionRequest,
+	type DeleteSessionRequest,
 	type InitializeRequest,
 	type InitializeResponse,
+	type ListSessionsRequest,
+	type ListSessionsResponse,
 	type LoadSessionRequest,
 	type LoadSessionResponse,
 	methods,
@@ -26,6 +29,7 @@ import {
 import { isThinkingLevel, MODEL_CONFIG_ID, THINKING_CONFIG_ID } from "../map/config.js";
 import { toPiPrompt } from "../map/content.js";
 import { PiRpcError } from "../pi/rpc-client.js";
+import { PiSessionStore } from "../pi/session-store.js";
 import { authRequired, internalError, invalidParams, resourceNotFound } from "./errors.js";
 import { errorMessage, PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
@@ -74,6 +78,8 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onRequest(methods.agent.session.load, ({ params }) => connected().loadSession(params))
 		.onRequest(methods.agent.session.resume, ({ params }) => connected().resumeSession(params))
 		.onRequest(methods.agent.session.close, ({ params }) => connected().closeSession(params))
+		.onRequest(methods.agent.session.list, ({ params }) => connected().listSessions(params))
+		.onRequest(methods.agent.session.delete, ({ params }) => connected().deleteSession(params))
 		.onRequest(methods.agent.session.setConfigOption, ({ params }) => connected().setSessionConfigOption(params))
 		.onRequest(methods.agent.session.prompt, ({ params }) => connected().prompt(params))
 		.onNotification(methods.agent.session.cancel, ({ params }) => connected().cancel(params));
@@ -92,10 +98,12 @@ export class PiAcpAgent {
 	#options: PiAcpAgentOptions;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#sessions = new Map<string, PiSession>();
+	#store: PiSessionStore;
 
 	constructor(client: AgentContext, options: PiAcpAgentOptions) {
 		this.#client = client;
 		this.#options = options;
+		this.#store = new PiSessionStore({ piArgs: options.piArgs, env: options.env ?? process.env });
 	}
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -106,7 +114,7 @@ export class PiAcpAgent {
 			agentCapabilities: {
 				loadSession: true,
 				promptCapabilities: { image: true, embeddedContext: true, audio: false },
-				sessionCapabilities: { resume: {}, close: {} },
+				sessionCapabilities: { list: {}, delete: {}, resume: {}, close: {} },
 			},
 			// pi manages provider credentials itself (`pi auth login`), so there is
 			// nothing for the client to authenticate against.
@@ -141,6 +149,36 @@ export class PiAcpAgent {
 		const session = await this.#openStoredSession(params);
 		session.publishSessionStateSoon();
 		return { configOptions: session.configOptions() };
+	}
+
+	/** pi's stored sessions, newest first, in pages of {@link LIST_PAGE_SIZE}. */
+	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+		const offset = decodeCursor(params.cursor);
+		const sessions = await this.#store.list(params.cwd ?? undefined);
+		const page = sessions.slice(offset, offset + LIST_PAGE_SIZE);
+		const next = offset + LIST_PAGE_SIZE;
+		return {
+			sessions: page.map((session) => ({
+				sessionId: session.path,
+				cwd: session.cwd,
+				...(session.title ? { title: session.title } : {}),
+				...(session.updatedAt ? { updatedAt: session.updatedAt } : {}),
+			})),
+			...(next < sessions.length ? { nextCursor: encodeCursor(next) } : {}),
+		};
+	}
+
+	/** Remove a stored session from disk, stopping it first if it is open. */
+	async deleteSession(params: DeleteSessionRequest): Promise<void> {
+		if (!(await this.#store.isStoredSession(params.sessionId))) {
+			throw resourceNotFound(`No stored pi session: ${params.sessionId}`);
+		}
+		const running = this.#sessions.get(params.sessionId);
+		this.#sessions.delete(params.sessionId);
+		await running?.close();
+		if (!(await this.#store.remove(params.sessionId))) {
+			throw resourceNotFound(`No stored pi session: ${params.sessionId}`);
+		}
 	}
 
 	/** Cancel any running turn and stop the session's pi process. */
@@ -268,6 +306,23 @@ export class PiAcpAgent {
 	}
 }
 
+const LIST_PAGE_SIZE = 100;
+
+/** Cursors are opaque to the client; this one is a base64url offset. */
+function encodeCursor(offset: number): string {
+	return Buffer.from(JSON.stringify({ offset })).toString("base64url");
+}
+
+function decodeCursor(cursor: string | null | undefined): number {
+	if (!cursor) return 0;
+	try {
+		const { offset } = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { offset?: unknown };
+		if (typeof offset === "number" && Number.isInteger(offset) && offset >= 0) return offset;
+	} catch {
+		// Fall through to the error below.
+	}
+	throw invalidParams("Invalid session/list cursor");
+}
 
 function toRequestError(error: unknown): RequestError {
 	if (error instanceof RequestError) return error;

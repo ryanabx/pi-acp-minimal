@@ -1,3 +1,5 @@
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
@@ -56,4 +58,51 @@ describe.skipIf(!enabled)("real pi", () => {
 			cleanup();
 		}
 	}, 60_000);
+
+	it("lists, resumes, closes and deletes pi's stored sessions", async () => {
+		// A `trash` that only deletes, so nothing lands in the machine's real trash.
+		const bin = fakeTrashBin();
+		const { client, workspace, cleanup } = createTestClient({
+			piCommand,
+			extraArgs: ownSessionDir,
+			env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+		});
+		try {
+			await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const { sessionId } = await client.newSession({ cwd: workspace, mcpServers: [] });
+			// pi writes the session file once the conversation has a message.
+			const pending = client.prompt({ sessionId, prompt: [{ type: "text", text: "Count to a million." }] });
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			client.cancel(sessionId);
+			await pending;
+
+			const listed = await client.request<{ sessions: Array<{ sessionId: string; title?: string }> }>("session/list", {
+				cwd: workspace,
+			});
+			expect(listed.sessions.map((session) => session.sessionId)).toEqual([sessionId]);
+			expect(listed.sessions[0]?.title).toBe("Count to a million.");
+
+			const resumed = await client.request<{ configOptions: unknown[] }>("session/resume", {
+				sessionId,
+				cwd: workspace,
+				mcpServers: [],
+			});
+			expect(resumed.configOptions.length).toBeGreaterThan(0);
+
+			await client.request("session/close", { sessionId });
+			await client.request("session/delete", { sessionId });
+			expect(existsSync(sessionId)).toBe(false);
+			expect((await client.request<{ sessions: unknown[] }>("session/list", { cwd: workspace })).sessions).toEqual([]);
+		} finally {
+			cleanup();
+			rmSync(bin, { recursive: true, force: true });
+		}
+	}, 60_000);
 });
+
+function fakeTrashBin(): string {
+	const bin = mkdtempSync(path.join(tmpdir(), "pi-acp-fake-trash-"));
+	writeFileSync(path.join(bin, "trash"), '#!/bin/sh\nrm -- "$1"\n');
+	chmodSync(path.join(bin, "trash"), 0o755);
+	return bin;
+}
