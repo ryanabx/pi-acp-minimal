@@ -382,6 +382,36 @@ describe("session/load", () => {
 			replayed.some((u) => u.sessionUpdate === "agent_message_chunk" && u.content.type === "text" && u.content.text.includes("Hello, world!")),
 		).toBe(true);
 	});
+
+	it("replays displayable custom messages and skips model-context roles", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });
+
+		// Seed the stored transcript the way pi 1.x does: system messages and
+		// summaries are model context, custom messages are visible only when
+		// display is true.
+		const messages = JSON.parse(readFileSync(sessionId, "utf8"));
+		messages.push(
+			{ role: "system", content: "You are a coding agent.", timestamp: Date.now() },
+			{ role: "custom", customType: "note", content: "extension note", display: true, timestamp: Date.now() },
+			{ role: "custom", customType: "note", content: "hidden note", display: false, timestamp: Date.now() },
+			{ role: "branchSummary", summary: "branch summary", fromId: null, timestamp: Date.now() },
+		);
+		writeFileSync(sessionId, JSON.stringify(messages));
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+
+		const replayedText = client.updates
+			.slice(before)
+			.filter((u) => u.sessionUpdate === "user_message_chunk" && u.content.type === "text")
+			.map((u) => (u.sessionUpdate === "user_message_chunk" && u.content.type === "text" ? u.content.text : ""))
+			.join("");
+		expect(replayedText).toContain("extension note");
+		expect(replayedText).not.toContain("hidden note");
+		expect(replayedText).not.toContain("branch summary");
+		expect(replayedText).not.toContain("You are a coding agent.");
+	});
 });
 
 describe("prompt content mapping", () => {

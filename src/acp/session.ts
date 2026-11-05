@@ -461,6 +461,22 @@ export class PiSession {
 				await this.#notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
 				return;
 			}
+
+			case "custom": {
+				// Extension context message. pi shows these only when `display` is
+				// true and converts them to a user message for the model.
+				if (!message.display) return;
+				for (const content of toAcpContentBlocks(message.content)) {
+					await this.#notify({ sessionUpdate: "user_message_chunk", content });
+				}
+				return;
+			}
+
+			default:
+				// system, branchSummary and compactionSummary are model context, not
+				// transcript: pi sends them in get_messages but they are not part of
+				// the conversation a client wants reloaded.
+				return;
 		}
 	}
 
