@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { createTestClient } from "./harness.js";
@@ -11,10 +12,12 @@ import { createTestClient } from "./harness.js";
  */
 const enabled = process.env.PI_ACP_REAL_PI === "1";
 const piCommand = process.env.PI_ACP_PI_COMMAND ?? "pi";
+/** Keep pi's session files in the temporary workspace rather than in ~/.pi. */
+const ownSessionDir = (workspace: string) => ["--session-dir", path.join(workspace, "sessions")];
 
 describe.skipIf(!enabled)("real pi", () => {
 	it("completes the ACP handshake and reports pi's real configuration", async () => {
-		const { client, workspace, cleanup } = createTestClient({ piCommand });
+		const { client, workspace, cleanup } = createTestClient({ piCommand, extraArgs: ownSessionDir });
 		try {
 			const init = await client.initialize({
 				protocolVersion: PROTOCOL_VERSION,
@@ -40,7 +43,7 @@ describe.skipIf(!enabled)("real pi", () => {
 	}, 60_000);
 
 	it("cancels an in-flight prompt", async () => {
-		const { client, workspace, cleanup } = createTestClient({ piCommand });
+		const { client, workspace, cleanup } = createTestClient({ piCommand, extraArgs: ownSessionDir });
 		try {
 			await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
 			const { sessionId } = await client.newSession({ cwd: workspace, mcpServers: [] });

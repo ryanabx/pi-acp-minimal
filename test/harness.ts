@@ -271,13 +271,21 @@ export class TestClient {
 }
 
 /** Temporary workspace plus a connected client; the caller runs `cleanup`. */
-export function createTestClient(options: { piCommand?: string; extraArgs?: string[]; env?: NodeJS.ProcessEnv } = {}): {
+export function createTestClient(
+	options: {
+		piCommand?: string;
+		/** Extra adapter arguments, or a function of the new workspace that returns them. */
+		extraArgs?: string[] | ((workspace: string) => string[]);
+		env?: NodeJS.ProcessEnv;
+	} = {},
+): {
 	client: TestClient;
 	workspace: string;
 	cleanup: () => void;
 } {
 	const workspace = mkdtempSync(path.join(tmpdir(), "pi-acp-minimal-test-"));
-	const client = new TestClient({ workspace, ...options });
+	const extraArgs = typeof options.extraArgs === "function" ? options.extraArgs(workspace) : options.extraArgs;
+	const client = new TestClient({ workspace, ...options, extraArgs });
 	return {
 		client,
 		workspace,
