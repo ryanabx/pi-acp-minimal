@@ -19,6 +19,8 @@ import type {
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
 
+import { ConformanceMonitor } from "./conformance/monitor.js";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 const MOCK_PI = path.join(here, "mock-pi.mjs");
@@ -54,6 +56,11 @@ export class AdapterError extends Error {
  * `session/set_mode` from `setSessionModel`, which would make that untestable.)
  */
 export class TestClient {
+	/** Every client created, so the conformance check can inspect them after each test. */
+	static readonly instances = new Set<TestClient>();
+
+	/** Checks every frame in both directions against ACP v1; see conformance/monitor.ts. */
+	readonly conformance = new ConformanceMonitor();
 	readonly updates: Update[] = [];
 	readonly permissionRequests: RequestPermissionRequest[] = [];
 	readonly stderr: string[] = [];
@@ -82,6 +89,7 @@ export class TestClient {
 
 	constructor(options: { workspace: string; piCommand?: string; extraArgs?: string[]; env?: NodeJS.ProcessEnv }) {
 		this.workspace = options.workspace;
+		TestClient.instances.add(this);
 		this.#process = spawn(
 			"node",
 			[
@@ -109,7 +117,16 @@ export class TestClient {
 			while ((index = buffer.indexOf("\n")) !== -1) {
 				const line = buffer.slice(0, index);
 				buffer = buffer.slice(index + 1);
-				if (line.trim()) this.#handle(JSON.parse(line) as JsonRpcMessage);
+				if (!line.trim()) continue;
+				let message: unknown;
+				try {
+					message = JSON.parse(line);
+				} catch {
+					this.conformance.fromAgent(line);
+					continue;
+				}
+				this.conformance.fromAgent(message);
+				this.#handle(message as JsonRpcMessage);
 			}
 		});
 	}
@@ -211,6 +228,7 @@ export class TestClient {
 	// --------------------------------------------------------------------------
 
 	#write(message: JsonRpcMessage): void {
+		this.conformance.fromClient(message);
 		this.#process.stdin.write(`${JSON.stringify(message)}\n`);
 	}
 
