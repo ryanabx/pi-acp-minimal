@@ -18,6 +18,8 @@ import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import { TestClient } from "../test/harness.js";
 
 const MODEL = process.env.LIVE_MODEL ?? "llama.cpp/Qwen3.8-27B-Fast";
+// A second, different model to switch to; must exist in the server's catalog.
+const SWITCH_MODEL = process.env.LIVE_SWITCH_MODEL ?? "llama.cpp/Qwen3.8-27B-Large";
 const workspace = mkdtempSync(path.join(tmpdir(), "pi-acp-minimal-live-"));
 writeFileSync(path.join(workspace, "hello.txt"), "hello world\n");
 
@@ -108,7 +110,7 @@ try {
 
 	// ---- model switch (no prompt, so no second model loads) -----------------
 	say("=== set_config_option ===");
-	const switched = await client.setConfigOption(session.sessionId, "model", "llama.cpp/Qwen3.8-27B-Large");
+	const switched = await client.setConfigOption(session.sessionId, "model", SWITCH_MODEL);
 	say(`MODEL   ${JSON.stringify((switched.configOptions as any[]).find((o) => o.id === "model")?.currentValue)} (not loaded: no prompt sent)`);
 	await client.setConfigOption(session.sessionId, "model", MODEL);
 
