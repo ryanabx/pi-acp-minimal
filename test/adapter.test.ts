@@ -774,6 +774,27 @@ describe("session/load", () => {
 		).toBe(true);
 	});
 
+	it("gives replayed messages the ids they had live", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "THINK please" }] });
+		const ids = (updates: typeof client.updates) =>
+			updates.flatMap((u) =>
+				u.sessionUpdate === "agent_message_chunk" || u.sessionUpdate === "agent_thought_chunk"
+					? [`${u.sessionUpdate} ${u.messageId}`]
+					: [],
+			);
+		const live = [...new Set(ids(client.updates))];
+		// One message per content part: the thought, then the text.
+		expect(live).toEqual([expect.stringMatching(/^agent_thought_chunk a-\d+:0$/), expect.stringMatching(/^agent_message_chunk a-\d+:1$/)]);
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+		const replayed = client.updates.slice(before);
+		expect(ids(replayed)).toEqual(live);
+		const user = replayed.find((u) => u.sessionUpdate === "user_message_chunk");
+		expect(user && "messageId" in user ? user.messageId : undefined).toMatch(/^u-\d+$/);
+	});
+
 	it("replays displayable custom messages and skips model-context roles", async () => {
 		const { sessionId } = await newSession();
 		await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT please" }] });

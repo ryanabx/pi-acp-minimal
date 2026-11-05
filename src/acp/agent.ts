@@ -1,11 +1,9 @@
 import { readFileSync } from "node:fs";
 import {
 	type AgentApp,
-	type AgentContext,
 	agent as agentApp,
 	type AuthenticateRequest,
 	type CancelNotification,
-	type ClientCapabilities,
 	type CloseSessionRequest,
 	type DeleteSessionRequest,
 	type InitializeRequest,
@@ -32,6 +30,7 @@ import { toPiPrompt } from "../map/content.js";
 import { toPiMcpServers } from "../map/mcp.js";
 import { PiRpcError } from "../pi/rpc-client.js";
 import { PiSessionStore } from "../pi/session-store.js";
+import { type ClientPort, V1ClientPort } from "./client-port.js";
 import { authRequired, internalError, invalidParams, resourceNotFound } from "./errors.js";
 import { errorMessage, PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
@@ -61,6 +60,7 @@ const PACKAGE: { name: string; version: string } = JSON.parse(
  */
 export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; shutdown: () => Promise<void> } {
 	let agent: PiAcpAgent | undefined;
+	let port: V1ClientPort | undefined;
 	const connected = (): PiAcpAgent => {
 		if (!agent) throw internalError("ACP connection is not set up");
 		return agent;
@@ -70,11 +70,15 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onConnect((connection) => {
 			// onConnect runs before the connection handles its first message.
 			if (agent) throw new Error("createPiAgentApp serves a single connection; build one app per connection");
-			const current = new PiAcpAgent(connection.client, options);
+			port = new V1ClientPort(connection.client, undefined);
+			const current = new PiAcpAgent(port, options);
 			agent = current;
 			void connection.closed.then(() => current.shutdown());
 		})
-		.onRequest(methods.agent.initialize, ({ params }) => connected().initialize(params))
+		.onRequest(methods.agent.initialize, ({ params }) => {
+			if (port) port.capabilities = params.clientCapabilities;
+			return connected().initialize(params);
+		})
 		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))
 		.onRequest(methods.agent.session.new, ({ params }) => connected().newSession(params))
 		.onRequest(methods.agent.session.load, ({ params }) => connected().loadSession(params))
@@ -96,20 +100,18 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
  * is also how per-session working directories, settings and extensions are honoured.
  */
 export class PiAcpAgent {
-	#client: AgentContext;
+	#client: ClientPort;
 	#options: PiAcpAgentOptions;
-	#clientCapabilities: ClientCapabilities | undefined;
 	#sessions = new Map<string, PiSession>();
 	#store: PiSessionStore;
 
-	constructor(client: AgentContext, options: PiAcpAgentOptions) {
+	constructor(client: ClientPort, options: PiAcpAgentOptions) {
 		this.#client = client;
 		this.#options = options;
 		this.#store = new PiSessionStore({ piArgs: options.piArgs, env: options.env ?? process.env });
 	}
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
-		this.#clientCapabilities = params.clientCapabilities;
 		return {
 			protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
 			agentInfo: { name: PACKAGE.name, title: "pi", version: PACKAGE.version },
@@ -255,12 +257,16 @@ export class PiAcpAgent {
 		return { configOptions: session.acknowledgeConfigOptions() };
 	}
 
-	async prompt(params: PromptRequest): Promise<PromptResponse> {
+	/** See {@link PiSession.prompt} for `onInserted`. */
+	async prompt(
+		params: PromptRequest,
+		hooks: { onInserted?: (messageId: string) => void } = {},
+	): Promise<PromptResponse> {
 		const session = this.#session(params.sessionId);
 		const { message, images } = toPiPrompt(params.prompt);
 		if (!message && images.length === 0) throw invalidParams("Prompt is empty");
 
-		const stopReason = await session.prompt(message, images);
+		const stopReason = await session.prompt(message, images, hooks);
 		return { stopReason };
 	}
 
@@ -281,7 +287,6 @@ export class PiAcpAgent {
 	): Promise<PiSession> {
 		const session = new PiSession({
 			client: this.#client,
-			clientCapabilities: this.#clientCapabilities,
 			cwd,
 			piCommand: this.#options.piCommand,
 			piArgs: this.#options.piArgs,

@@ -122,12 +122,23 @@ const scenarios = [
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
 ];
 
+/** pi stamps an assistant message once, when it starts streaming; the stored copy keeps that time. */
+let assistantTimestamp = 0;
+
 function startAssistant() {
+	assistantTimestamp = uniqueTimestamp();
 	write({ type: "turn_start" });
 	write({
 		type: "message_start",
-		message: { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4", usage, timestamp: Date.now() },
+		message: { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4", usage, timestamp: assistantTimestamp },
 	});
+}
+
+/** Date.now(), but never twice the same: scenarios run faster than a millisecond. */
+let lastTimestamp = 0;
+function uniqueTimestamp() {
+	lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+	return lastTimestamp;
 }
 
 /** pi 1.x reports a per-input disposition on the prompt response. */
@@ -146,7 +157,7 @@ function endAssistant(content, stopReason, errorMessage) {
 		model: "claude-sonnet-4",
 		usage,
 		stopReason,
-		timestamp: Date.now(),
+		timestamp: assistantTimestamp,
 	};
 	if (errorMessage) message.errorMessage = errorMessage;
 	messages.push(message);
@@ -426,7 +437,7 @@ function waitForUiResponse(id) {
 
 async function runPrompt(message) {
 	aborted = false;
-	messages.push({ role: "user", content: [{ type: "text", text: message }], timestamp: Date.now() });
+	messages.push({ role: "user", content: [{ type: "text", text: message }], timestamp: uniqueTimestamp() });
 	if (!/\bNOOP\b/.test(message)) write({ type: "agent_start" });
 	write({ type: "message_start", message: messages.at(-1) });
 	write({ type: "message_end", message: messages.at(-1) });
