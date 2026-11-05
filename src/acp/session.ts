@@ -76,6 +76,11 @@ const STOP_REASONS: Record<PiStopReason, PromptStopReason | undefined> = {
 	length: "max_tokens",
 	aborted: "cancelled",
 	error: undefined,
+	// Defensive: `pending` never reaches `message_end`, and a `deferred`
+	// response's final content is fetched out of band, so both end the turn
+	// as far as the client is concerned.
+	pending: "end_turn",
+	deferred: "end_turn",
 };
 
 /**

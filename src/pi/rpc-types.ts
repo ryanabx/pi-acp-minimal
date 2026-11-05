@@ -3,8 +3,10 @@
  *
  * These types are copied by shape rather than imported from
  * `@earendil-works/pi-coding-agent` so the adapter stays a plain JSONL client
- * with no dependency on pi's internals. See `packages/coding-agent/docs/rpc.md`
- * in the pi repository for the authoritative protocol description.
+ * with no dependency on pi's internals. See `docs/rpc.md` and its
+ * companions (`rpc-commands.md`, `json.md`, `rpc-extension-ui.md`,
+ * `message-types.md`) in the pi repository for the authoritative protocol
+ * description. This mirror tracks pi 1.5.0.
  */
 
 // ============================================================================
@@ -14,6 +16,8 @@
 export interface PiTextContent {
 	type: "text";
 	text: string;
+	/** Provider-specific message metadata; opaque. */
+	textSignature?: string;
 }
 
 export interface PiImageContent {
@@ -28,12 +32,20 @@ export interface PiToolCallContent {
 	type: "toolCall";
 	id: string;
 	name: string;
+	/** `{}` when `argumentsError` is set: the model's arguments were not valid JSON. */
 	arguments: Record<string, unknown>;
+	thoughtSignature?: string;
+	/** OpenAI Responses namespace for calls to dynamically loaded or namespaced tools. */
+	namespace?: string;
+	argumentsError?: string;
 }
 
 export interface PiThinkingContent {
 	type: "thinking";
 	thinking: string;
+	thinkingSignature?: string;
+	/** True when the block was redacted by safety filters; the payload lives in `thinkingSignature`. */
+	redacted?: boolean;
 }
 
 export type PiAssistantContent = PiTextContent | PiThinkingContent | PiToolCallContent;
@@ -51,11 +63,22 @@ export interface PiUsage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
-	totalTokens?: number;
-	cost: PiCost;
+	/** Subset of `cacheWrite` written with 1h retention. Only Anthropic reports this split. */
+	cacheWrite1h?: number;
+	/** Reasoning tokens; a subset of `output`, never add it again. */
+	reasoning?: number;
+	totalTokens: number;
+	cost: PiCost & { totalFromProvider?: boolean };
 }
 
-export type PiStopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
+/**
+ * Stop reasons on an assistant message.
+ *
+ * `pending` only ever appears on the partial message of an in-flight response;
+ * the authoritative `message_end` carries a terminal reason. `deferred` marks a
+ * provider response whose final content is fetched later from a `DeferredHandle`.
+ */
+export type PiStopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
 
 export interface PiUserMessage {
 	role: "user";
@@ -70,10 +93,23 @@ export interface PiAssistantMessage {
 	api?: string;
 	provider?: string;
 	model?: string;
+	/** Concrete model reported by the provider, when it reports one. */
+	responseModel?: string;
+	responseId?: string;
+	/** Exact provider-native effort level used for this response. */
+	providerThinkingLevel?: string;
+	/** pi's thinking level for this response. */
+	thinkingLevel?: PiThinkingLevel;
+	diagnostics?: unknown[];
 	usage?: PiUsage;
 	stopReason?: PiStopReason;
+	/** Present with `stopReason: "deferred"`; carries the provider data for the final content. */
+	deferred?: unknown;
 	errorMessage?: string;
+	rawStopReason?: string;
+	endTurn?: boolean;
 	timestamp?: number;
+	durationMs?: number;
 }
 
 export interface PiToolResultMessage {
@@ -81,7 +117,11 @@ export interface PiToolResultMessage {
 	toolCallId: string;
 	toolName: string;
 	content: PiContent[];
+	details?: unknown;
+	/** Nested model work the tool performed; not part of the main model-call usage. */
 	usage?: PiUsage;
+	/** Bounded metadata about calls this tool made to other tools. */
+	nestedCalls?: { calls: unknown[]; complete: boolean };
 	isError?: boolean;
 	timestamp?: number;
 }
@@ -90,14 +130,64 @@ export interface PiBashExecutionMessage {
 	role: "bashExecution";
 	command: string;
 	output: string;
-	exitCode: number | null;
+	/** Absent when the command was killed or cancelled. */
+	exitCode?: number;
 	cancelled: boolean;
 	truncated: boolean;
-	fullOutputPath: string | null;
+	fullOutputPath?: string;
+	excludeFromContext?: boolean;
 	timestamp?: number;
 }
 
-export type PiMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage | PiBashExecutionMessage;
+export interface PiSystemMessage {
+	role: "system";
+	content: string | PiTextContent[];
+	sections?: Record<string, string | null>;
+	toolsAdded?: unknown[];
+	toolsRemoved?: unknown[];
+	timestamp: number;
+}
+
+/** Context message an extension sent; `display` controls whether pi shows it. */
+export interface PiCustomMessage {
+	role: "custom";
+	customType: string;
+	content: string | PiContent[];
+	display: boolean;
+	details?: unknown;
+	timestamp: number;
+}
+
+export interface PiBranchSummaryMessage {
+	role: "branchSummary";
+	summary: string;
+	fromId: string | null;
+	timestamp: number;
+}
+
+export interface PiCompactionSummaryMessage {
+	role: "compactionSummary";
+	summary: string;
+	tokensBefore: number;
+	timestamp: number;
+}
+
+/**
+ * Every role pi can return, for example from `get_messages`.
+ *
+ * Roles beyond the four conversational ones are model context, not transcript:
+ * `system` is the running system prompt, the summaries are compaction/branch
+ * artifacts, and `custom` is visible only when `display` is true.
+ */
+export type PiMessage =
+	| PiSystemMessage
+	| PiUserMessage
+	| PiAssistantMessage
+	| PiToolResultMessage
+	| PiBashExecutionMessage
+	| PiCustomMessage
+	| PiBranchSummaryMessage
+	| PiCompactionSummaryMessage;
 
 export interface PiToolResult {
 	content: PiContent[];
@@ -164,11 +254,16 @@ export type PiRpcCommand =
 
 export type PiRpcCommandType = PiRpcCommand["type"];
 
+/** What pi did with a `steer`/`follow_up` input. */
+export type PiQueuedInputDisposition = "handled" | "queued";
+/** What pi did with a `prompt`: the queued-input outcomes, plus a fresh run. */
+export type PiPromptDisposition = PiQueuedInputDisposition | "started";
+
 /** Maps a command type to the shape of its successful `data` payload. */
 export interface PiRpcResponseData {
-	prompt: undefined;
-	steer: undefined;
-	follow_up: undefined;
+	prompt: { disposition: PiPromptDisposition };
+	steer: { disposition: PiQueuedInputDisposition };
+	follow_up: { disposition: PiQueuedInputDisposition };
 	abort: undefined;
 	clear_queue: { steering: string[]; followUp: string[] };
 	new_session: { cancelled: boolean };
@@ -231,7 +326,8 @@ export interface PiSessionStats {
 
 export interface PiBashResult {
 	output: string;
-	exitCode: number | null;
+	/** Absent when the command was killed or cancelled. */
+	exitCode?: number;
 	cancelled: boolean;
 	truncated: boolean;
 	fullOutputPath?: string;
@@ -291,28 +387,49 @@ export type PiAssistantMessageEvent =
 export type PiRpcEvent =
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: PiMessage[]; willRetry?: boolean }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; aborted?: boolean }
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: PiMessage; toolResults: PiToolResultMessage[] }
 	| { type: "message_start"; message: PiMessage }
 	| { type: "message_update"; usage: PiUsage; assistantMessageEvent: PiAssistantMessageEvent }
 	| { type: "message_end"; message: PiMessage }
 	| { type: "bash_execution_update"; id?: string; delta: string }
-	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: Record<string, unknown> }
+	| {
+			type: "tool_execution_start";
+			toolCallId: string;
+			toolName: string;
+			args: Record<string, unknown>;
+			/** Set on calls a tool made through `ctx.executeTool()`: the calling tool's id. */
+			parentToolCallId?: string;
+	  }
 	| {
 			type: "tool_execution_update";
 			toolCallId: string;
 			toolName: string;
 			args: Record<string, unknown>;
 			partialResult: PiToolResult;
+			parentToolCallId?: string;
 	  }
-	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: PiToolResult; isError: boolean }
-	| { type: "queue_update"; steering: string[]; followUp: string[] }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: PiToolResult;
+			isError: boolean;
+			parentToolCallId?: string;
+			/** Wall-clock execution time; absent when the tool did not run. */
+			durationMs?: number;
+	  }
+	| { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
+	| { type: "entry_appended"; entry: unknown }
+	| { type: "session_info_changed"; name?: string }
+	| { type: "thinking_level_changed"; level: PiThinkingLevel }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
-			result: PiCompactionResult | null;
+			/** Absent when compaction failed or was aborted. */
+			result?: PiCompactionResult;
 			aborted: boolean;
 			willRetry?: boolean;
 			errorMessage?: string;

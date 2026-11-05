@@ -109,6 +109,12 @@ function startAssistant() {
 	});
 }
 
+/** pi 1.x reports a per-input disposition on the prompt response. */
+function promptDisposition(message) {
+	// The NOOP scenario is an extension command that consumes the prompt inline.
+	return { disposition: /\bNOOP\b/.test(message) ? "handled" : "started" };
+}
+
 function endAssistant(content, stopReason, errorMessage) {
 	const message = {
 		role: "assistant",
@@ -190,6 +196,7 @@ async function bashScenario() {
 		toolName: "bash",
 		result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 } },
 		isError: false,
+		durationMs: 42,
 	});
 	endAssistant([{ type: "toolCall", id: "call-bash", name: "bash", arguments: args }], "toolUse");
 }
@@ -297,7 +304,7 @@ async function runPrompt(message) {
 	write({ type: "agent_end", messages: [], willRetry: false });
 	state.isStreaming = false;
 	persist();
-	write({ type: "agent_settled" });
+	write({ type: "agent_settled", aborted });
 }
 
 function success(id, command, data) {
@@ -364,7 +371,7 @@ async function handleCommand(command) {
 			return success(id, type);
 		case "prompt": {
 			state.isStreaming = true;
-			success(id, type);
+			success(id, type, promptDisposition(command.message));
 			void runPrompt(command.message).catch((error) => {
 				process.stderr.write(`mock-pi scenario failed: ${error?.stack ?? error}\n`);
 			});
