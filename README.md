@@ -125,7 +125,7 @@ even where a mapping step has to await the file system.
 |---|---|
 | `initialize` | — (capability negotiation only) |
 | `session/new` | spawn `pi --mode rpc` in `cwd`, then `get_state` + `get_available_models` + `get_available_thinking_levels` + `get_commands` |
-| `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates |
+| `session/load` | spawn `pi --mode rpc --session <file>`, then `get_messages` replayed as updates (stored compaction summaries as completed `compaction_update`s, for clients that track compactions) |
 | `session/resume` | spawn `pi --mode rpc --session <file>`, no replay |
 | `session/close` | `abort` if a turn is running, then stop the pi process |
 | `session/list` | read pi's session files (pi has no RPC command for it; see below) |
@@ -158,6 +158,7 @@ deletes pi session files inside that store.
 | `tool_execution_update` | `tool_call_update` with the accumulated output |
 | `tool_execution_end` | `tool_call_update` (status `completed`/`failed`), diff or text content, `rawOutput` |
 | `agent_settled` | resolves `session/prompt` |
+| `compaction_start` / `compaction_end` | one `compaction_update` entity (in progress → completed with pi's summary, failed, or cancelled) when the client advertises `session.compaction`; otherwise status lines as below |
 | `compaction_*`, `auto_retry_*`, `summarization_retry_*`, `extension_error`, extension `notify` | `notice` when the client advertises `session.notices`, else italic `agent_message_chunk` status lines |
 | `session_info_changed`, and `get_state.sessionName` when a session opens | `session_info_update` with the name as `title` (`null` when cleared) |
 | `get_commands` (polled after each turn) | `available_commands_update` |

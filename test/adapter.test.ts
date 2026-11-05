@@ -485,6 +485,57 @@ describe("notices", () => {
 	});
 });
 
+describe("compaction", () => {
+	const compactionUpdates = (updates: typeof client.updates) =>
+		updates.filter((u) => u.sessionUpdate === "compaction_update");
+
+	it("tracks a compaction as one entity for a client that supports it", async () => {
+		const { client: tracking, sessionId, done } = await clientWith({ session: { compaction: {} } });
+		try {
+			await tracking.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACT please" }] });
+			await tracking.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACTFAIL please" }] });
+			expect(compactionUpdates(tracking.updates)).toEqual([
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-1", status: "in_progress" },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: "pi-compaction-1",
+					status: "completed",
+					summary: [{ type: "text", text: "Summary of the earlier conversation." }],
+				},
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-2", status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: "pi-compaction-2", status: "failed", error: "model refused" },
+			]);
+			expect(tracking.agentText()).not.toContain("Compact");
+
+			// session/load shows where the stored compaction happened.
+			const before = tracking.updates.length;
+			await tracking.loadSession({ sessionId, cwd: tracking.workspace, mcpServers: [] });
+			expect(compactionUpdates(tracking.updates.slice(before))).toEqual([
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: "pi-compaction-1",
+					status: "completed",
+					summary: [{ type: "text", text: "Summary of the earlier conversation." }],
+				},
+			]);
+		} finally {
+			done();
+		}
+	});
+
+	it("reports compaction as status lines otherwise, and does not replay summaries", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "COMPACT please" }] });
+		expect(compactionUpdates(client.updates)).toEqual([]);
+		expect(client.agentText()).toContain("Context compacted (~1000 → ~200 tokens).");
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+		expect(compactionUpdates(client.updates.slice(before))).toEqual([]);
+		expect(client.agentText()).not.toContain("Summary of the earlier conversation.");
+	});
+});
+
 describe("session titles", () => {
 	const titles = (updates: typeof client.updates) =>
 		updates.flatMap((u) => (u.sessionUpdate === "session_info_update" ? [u.title] : []));

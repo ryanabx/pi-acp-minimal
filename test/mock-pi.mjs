@@ -103,6 +103,8 @@ const scenarios = [
 	{ match: /\bSELFABORT\b/, run: selfAbortScenario },
 	{ match: /\bLEVELCHANGE\b/, run: levelChangeScenario },
 	{ match: /\bRENAME\b/, run: renameScenario },
+	{ match: /\bCOMPACTFAIL\b/, run: compactFailScenario },
+	{ match: /\bCOMPACT\b/, run: compactScenario },
 	{ match: /\bUNNAME\b/, run: unnameScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
@@ -333,6 +335,29 @@ async function selfAbortScenario() {
 	write({ type: "tool_execution_start", toolCallId: "call-slow", toolName: "bash", args });
 	aborted = true;
 	endAssistant([{ type: "toolCall", id: "call-slow", name: "bash", arguments: args }], "toolUse");
+}
+
+/** pi compacts the context before answering, as it does past its threshold. */
+async function compactScenario() {
+	write({ type: "compaction_start", reason: "threshold" });
+	await sleep(5);
+	const summary = "Summary of the earlier conversation.";
+	messages.push({ role: "compactionSummary", summary, tokensBefore: 1000, timestamp: Date.now() });
+	write({
+		type: "compaction_end",
+		reason: "threshold",
+		result: { summary, firstKeptEntryId: "e1", tokensBefore: 1000, estimatedTokensAfter: 200, details: {} },
+		aborted: false,
+		willRetry: false,
+	});
+	await textScenario();
+}
+
+/** Compaction fails: pi omits the result and reports the error. */
+async function compactFailScenario() {
+	write({ type: "compaction_start", reason: "manual" });
+	write({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false, errorMessage: "model refused" });
+	await textScenario();
 }
 
 /** An extension names the session, as `pi.setSessionName()` or `/name` would. */

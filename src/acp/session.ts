@@ -127,6 +127,10 @@ export class PiSession {
 	#commandSignature = "";
 	#configSignature = "";
 	#usageSignature = "";
+	/** Compactions announced to the client so far; numbers their ids. */
+	#compactions = 0;
+	/** The compaction pi is running now, if the client tracks compactions. */
+	#activeCompactionId: string | null = null;
 	/** pi's session name; `null` once known to be unset. */
 	#title: string | null = null;
 	/** The title the client was last told about; `undefined` before the first update. */
@@ -528,10 +532,21 @@ export class PiSession {
 				return;
 			}
 
+			case "compactionSummary":
+				// A client that tracks compactions shows where one happened; for
+				// anyone else the summary is model context, not transcript.
+				if (!this.#tracksCompactions) return;
+				return this.#notify({
+					sessionUpdate: "compaction_update",
+					compactionId: this.#nextCompactionId(),
+					status: "completed",
+					summary: [{ type: "text", text: message.summary }],
+				});
+
 			default:
-				// system, branchSummary and compactionSummary are model context, not
-				// transcript: pi sends them in get_messages but they are not part of
-				// the conversation a client wants reloaded.
+				// system and branchSummary are model context, not transcript: pi
+				// sends them in get_messages but they are not part of the
+				// conversation a client wants reloaded.
 				return;
 		}
 	}
@@ -582,9 +597,18 @@ export class PiSession {
 				return this.#settleTurn(event.aborted === true);
 
 			case "compaction_start":
+				if (this.#tracksCompactions) {
+					this.#activeCompactionId = this.#nextCompactionId();
+					return this.#notify({
+						sessionUpdate: "compaction_update",
+						compactionId: this.#activeCompactionId,
+						status: "in_progress",
+					});
+				}
 				return this.#status(`Compacting context (${event.reason})…`);
 
 			case "compaction_end": {
+				if (this.#tracksCompactions) return this.#endCompaction(event);
 				if (event.aborted) return this.#status("Compaction aborted.");
 				if (!event.result) {
 					return this.#status("Compaction failed", { level: "error", description: event.errorMessage ?? "unknown error" });
@@ -986,6 +1010,39 @@ export class PiSession {
 	// ==========================================================================
 	// Notification helpers
 	// ==========================================================================
+
+	/** Whether the client advertised `session.compaction`, which compaction updates require. */
+	get #tracksCompactions(): boolean {
+		return Boolean(this.#clientCapabilities?.session?.compaction);
+	}
+
+	#nextCompactionId(): string {
+		return `pi-compaction-${++this.#compactions}`;
+	}
+
+	/** Finish the compaction entity opened on `compaction_start`. */
+	async #endCompaction(event: Extract<PiRpcEvent, { type: "compaction_end" }>): Promise<void> {
+		// An end without a start we saw still gets an entity of its own.
+		const compactionId = this.#activeCompactionId ?? this.#nextCompactionId();
+		this.#activeCompactionId = null;
+		if (event.aborted) {
+			return this.#notify({ sessionUpdate: "compaction_update", compactionId, status: "cancelled" });
+		}
+		if (!event.result) {
+			return this.#notify({
+				sessionUpdate: "compaction_update",
+				compactionId,
+				status: "failed",
+				error: event.errorMessage ?? "unknown error",
+			});
+		}
+		return this.#notify({
+			sessionUpdate: "compaction_update",
+			compactionId,
+			status: "completed",
+			summary: [{ type: "text", text: event.result.summary }],
+		});
+	}
 
 	/**
 	 * Out-of-band information for the user: retries, extension messages and the like.
