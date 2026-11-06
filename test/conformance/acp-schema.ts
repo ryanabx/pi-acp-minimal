@@ -3,8 +3,9 @@ import { createRequire } from "node:module";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 
 /**
- * Validators for ACP v1 messages, built from the official JSON schema that
- * ships with `@agentclientprotocol/sdk` (`schema/v1/schema.json`).
+ * Validators for ACP messages, built from the official JSON schemas that
+ * ship with `@agentclientprotocol/sdk`: `schema/v1/schema.json` for ACP v1 and
+ * `schema/v2/schema.json` for the stable feature set of the v2 draft.
  *
  * The schema's message-level definitions are unions over every method, which
  * would accept almost any payload (`{}` is a valid `LogoutResponse`), so
@@ -15,11 +16,20 @@ import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
  * quietly skip part of the schema.
  */
 const require = createRequire(import.meta.url);
-const SCHEMA_PATH = require.resolve("@agentclientprotocol/sdk/schema/v1/schema.json");
-const SCHEMA_ID = "https://agentclientprotocol.com/schema/v1.json";
+
+export type ProtocolVersion = 1 | 2;
 
 type Definition = { "x-method"?: string; "x-side"?: "agent" | "client" | "protocol" };
-const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as { $defs: Record<string, Definition> };
+type Schema = { $defs: Record<string, Definition> };
+
+const SCHEMA_IDS: Record<ProtocolVersion, string> = {
+	1: "https://agentclientprotocol.com/schema/v1.json",
+	2: "https://agentclientprotocol.com/schema/v2.json",
+};
+const SCHEMAS: Record<ProtocolVersion, Schema> = {
+	1: JSON.parse(readFileSync(require.resolve("@agentclientprotocol/sdk/schema/v1/schema.json"), "utf8")) as Schema,
+	2: JSON.parse(readFileSync(require.resolve("@agentclientprotocol/sdk/schema/v2/schema.json"), "utf8")) as Schema,
+};
 
 const ajv = new Ajv2020({ allErrors: true, discriminator: true, strict: false });
 // The schema's integer formats are Rust widths; check the ranges they promise.
@@ -41,16 +51,17 @@ ajv.addFormat("uri", (value: string) => {
 		return false;
 	}
 });
-ajv.addSchema({ ...schema, $id: SCHEMA_ID });
+for (const version of [1, 2] as const) ajv.addSchema({ ...SCHEMAS[version], $id: SCHEMA_IDS[version] });
 
 const compiled = new Map<string, ValidateFunction>();
-function validator(definition: string): ValidateFunction {
-	let validate = compiled.get(definition);
+function validator(version: ProtocolVersion, definition: string): ValidateFunction {
+	const key = `${version}:${definition}`;
+	let validate = compiled.get(key);
 	if (!validate) {
-		const found = ajv.getSchema(`${SCHEMA_ID}#/$defs/${definition}`);
-		if (!found) throw new Error(`ACP schema has no definition ${definition}`);
+		const found = ajv.getSchema(`${SCHEMA_IDS[version]}#/$defs/${definition}`);
+		if (!found) throw new Error(`ACP v${version} schema has no definition ${definition}`);
 		validate = found;
-		compiled.set(definition, validate);
+		compiled.set(key, validate);
 	}
 	return validate;
 }
@@ -71,7 +82,7 @@ interface MethodIndex {
 	agentNotifications: Map<string, string>;
 }
 
-function buildIndex(): MethodIndex {
+function buildIndex(schema: Schema): MethodIndex {
 	const index: MethodIndex = {
 		agentRequests: new Map(),
 		agentResponses: new Map(),
@@ -98,16 +109,12 @@ function buildIndex(): MethodIndex {
 	return index;
 }
 
-export const methods: MethodIndex = buildIndex();
+/** Each version's methods, by the schema definition their payloads must match. */
+export const methods: Record<ProtocolVersion, MethodIndex> = { 1: buildIndex(SCHEMAS[1]), 2: buildIndex(SCHEMAS[2]) };
 
 /** Validate `value` against a definition; returns readable errors, empty when valid. */
-export function validate(definition: string, value: unknown): string[] {
-	const check = validator(definition);
+export function validate(version: ProtocolVersion, definition: string, value: unknown): string[] {
+	const check = validator(version, definition);
 	if (check(value)) return [];
 	return (check.errors ?? []).slice(0, 5).map((error) => `${error.instancePath || "/"} ${error.message ?? "is invalid"}`);
-}
-
-/** Every definition that can be validated, for coverage reporting. */
-export function definitionNames(): string[] {
-	return Object.keys(schema.$defs);
 }

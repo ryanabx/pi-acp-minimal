@@ -6,7 +6,7 @@ import { ConformanceMonitor } from "./conformance/monitor.js";
 import { createTestClient, type TestClient } from "./harness.js";
 
 /**
- * ACP v1 conformance.
+ * ACP conformance, for v1 and for the v2 draft.
  *
  * Every test in the suite already runs under the conformance monitor (see
  * conformance/setup.ts). This file adds two things: proof that the monitor
@@ -150,6 +150,62 @@ describe("the conformance monitor", () => {
 		monitor.fromAgent({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: "never" } });
 		monitor.fromAgent({ jsonrpc: "2.0", method: "_vendor/extension", params: {} });
 		expect(rules(monitor)).toEqual(["unknown-method", "cancel-request"]);
+	});
+});
+
+describe("the conformance monitor, for a v2 client", () => {
+	/** A monitor that has seen a v2 initialize and session/new for session "s". */
+	function connectedV2(): ConformanceMonitor {
+		const monitor = new ConformanceMonitor();
+		monitor.fromClient({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 2, info: { name: "c", version: "0" } } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 1, result: { protocolVersion: 2, info: { name: "a", version: "0" } } });
+		monitor.fromClient({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/w" } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 2, result: { sessionId: "s" } });
+		return monitor;
+	}
+	const prompt = (id: number) => ({
+		jsonrpc: "2.0",
+		id,
+		method: "session/prompt",
+		params: { sessionId: "s", prompt: [{ type: "text", text: "hi" }] },
+	});
+
+	it("checks frames against the v2 schema", () => {
+		const monitor = connectedV2();
+		monitor.fromClient(prompt(3));
+		monitor.fromAgent(update("s", { sessionUpdate: "user_message", messageId: "u1", content: [{ type: "text", text: "hi" }] }));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: { messageId: "u1" } });
+		monitor.fromAgent(update("s", { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" }));
+		monitor.fromAgent(update("s", { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" }));
+		monitor.finish();
+		expect(monitor.violations).toEqual([]);
+
+		// v1 shapes are not v2: a chunk without its message id, a v1 prompt result.
+		monitor.fromAgent(update("s", text));
+		monitor.fromClient(prompt(4));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 4, result: { stopReason: "end_turn" } });
+		expect(rules(monitor)).toEqual(["schema", "schema"]);
+	});
+
+	it("flags v1-only updates", () => {
+		const monitor = connectedV2();
+		monitor.fromAgent(update("s", { sessionUpdate: "tool_call", toolCallId: "t1", title: "Read" }));
+		expect(rules(monitor)).toContain("version");
+	});
+
+	it("flags an accepted prompt that is never echoed as a user message", () => {
+		const monitor = connectedV2();
+		monitor.fromClient(prompt(3));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: { messageId: "u1" } });
+		monitor.finish();
+		expect(rules(monitor)).toEqual(["user-message"]);
+	});
+
+	it("flags a session/resume answered without a state update first", () => {
+		const monitor = connectedV2();
+		monitor.fromClient({ jsonrpc: "2.0", id: 3, method: "session/resume", params: { sessionId: "s", cwd: "/w" } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: {} });
+		expect(rules(monitor)).toEqual(["state"]);
 	});
 });
 
