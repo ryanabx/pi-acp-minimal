@@ -15,12 +15,12 @@ import {
 } from "@agentclientprotocol/sdk";
 import { fileURLToPath } from "node:url";
 import { toAcpCommand } from "../map/commands.js";
-import { assistantText, toAcpContentBlocks } from "../map/content.js";
+import { assistantText, contentToText, toAcpContentBlocks } from "../map/content.js";
 import { buildConfigOptions } from "../map/config.js";
 import { assistantPart, MessageIds } from "../map/message-ids.js";
 import { fromAcpModelId, toAcpModelId } from "../map/models.js";
 import type { PiMcpServerConfig } from "../map/mcp.js";
-import { isFileMutatingTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
+import { appendedOutput, isFileMutatingTool, isShellTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
 import { toAcpUsageUpdate } from "../map/usage.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
 import type {
@@ -68,6 +68,12 @@ interface ToolCallState {
 	oldText?: string | null;
 	filePath?: string;
 	announced: boolean;
+	/**
+	 * Set once the call's output goes to a display terminal: the latest output
+	 * snapshot already sent, which pi's cumulative updates are diffed against
+	 * because the terminal appends whatever it receives.
+	 */
+	terminalOutput?: string;
 }
 
 /** The pi extension that registers client-supplied MCP servers; see the file for why. */
@@ -560,6 +566,11 @@ export class PiSession {
 				return;
 			}
 			case "toolResult": {
+				const state = this.#toolCalls.get(message.toolCallId);
+				if (state && isShellTool(message.toolName) && this.#showsTerminals) {
+					await this.#openTerminal(message.toolCallId, state);
+					return this.#closeTerminal(message.toolCallId, state, message, message.isError === true);
+				}
 				await this.#notify({
 					sessionUpdate: "tool_call_update",
 					toolCallId: message.toolCallId,
@@ -878,6 +889,9 @@ export class PiSession {
 		if (!parentToolCallId) this.#activeToolCallId = toolCallId;
 		await this.#describeToolCall(toolCallId, toolName, args, "in_progress");
 
+		const started = this.#toolCalls.get(toolCallId);
+		if (started && isShellTool(toolName) && this.#showsTerminals) await this.#openTerminal(toolCallId, started);
+
 		// Snapshot the file before it changes so the completion can carry a real diff.
 		if (isFileMutatingTool(toolName)) {
 			const state = this.#toolCalls.get(toolCallId);
@@ -890,6 +904,10 @@ export class PiSession {
 	}
 
 	async #handleToolUpdate(toolCallId: string, partialResult: PiToolResult | undefined): Promise<void> {
+		const state = this.#toolCalls.get(toolCallId);
+		if (state?.terminalOutput !== undefined) {
+			return this.#writeTerminal(toolCallId, state, contentToText(partialResult?.content));
+		}
 		const content = toolResultContent(partialResult);
 		if (content.length === 0) return;
 		return this.#notify({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress", content });
@@ -900,6 +918,7 @@ export class PiSession {
 
 		const state = this.#toolCalls.get(toolCallId);
 		if (state) state.status = isError ? "failed" : "completed";
+		if (state?.terminalOutput !== undefined) return this.#closeTerminal(toolCallId, state, result, isError);
 
 		const content: ToolCallContent[] = [];
 		if (state && !isError && isFileMutatingTool(state.toolName) && state.filePath) {
@@ -916,6 +935,66 @@ export class PiSession {
 			toolCallId,
 			status: isError ? "failed" : "completed",
 			content,
+			...(isPlainObject(details) ? { rawOutput: details } : {}),
+		});
+	}
+
+	// ==========================================================================
+	// Display terminals
+	// ==========================================================================
+	//
+	// A client whose port displays terminals (ACP v2) shows a shell command's
+	// output in a terminal it only displays, named after the tool call; the
+	// tool call refers to it instead of carrying the output as text.
+
+	get #showsTerminals(): boolean {
+		return this.#port.displaysTerminals;
+	}
+
+	async #openTerminal(toolCallId: string, state: ToolCallState): Promise<void> {
+		if (state.terminalOutput !== undefined) return;
+		state.terminalOutput = "";
+		const command = typeof state.args?.command === "string" ? state.args.command : undefined;
+		// The terminal exists before the tool call refers to it.
+		await this.#port.terminal(this.sessionId, {
+			type: "open",
+			terminalId: toolCallId,
+			cwd: this.cwd,
+			...(command ? { command } : {}),
+		});
+		await this.#notify({
+			sessionUpdate: "tool_call_update",
+			toolCallId,
+			content: [{ type: "terminal", terminalId: toolCallId }],
+		});
+	}
+
+	async #writeTerminal(toolCallId: string, state: ToolCallState, snapshot: string): Promise<void> {
+		const data = appendedOutput(state.terminalOutput ?? "", snapshot);
+		state.terminalOutput = snapshot;
+		if (!data) return;
+		await this.#port.terminal(this.sessionId, { type: "output", terminalId: toolCallId, data });
+	}
+
+	async #closeTerminal(
+		toolCallId: string,
+		state: ToolCallState,
+		result: PiToolResult | undefined,
+		isError: boolean,
+	): Promise<void> {
+		// The final text adds pi's status lines ("Command exited with code 2",
+		// truncation notes) after the output already streamed.
+		await this.#writeTerminal(toolCallId, state, contentToText(result?.content));
+		const structured = result?.structuredContent;
+		const reported = isPlainObject(structured) ? structured.exit_code : undefined;
+		const exitCode = typeof reported === "number" ? reported : isError ? null : 0;
+		await this.#port.terminal(this.sessionId, { type: "exit", terminalId: toolCallId, exitCode });
+		const details = result?.details;
+		await this.#notify({
+			sessionUpdate: "tool_call_update",
+			toolCallId,
+			status: isError ? "failed" : "completed",
+			content: [{ type: "terminal", terminalId: toolCallId }],
 			...(isPlainObject(details) ? { rawOutput: details } : {}),
 		});
 	}

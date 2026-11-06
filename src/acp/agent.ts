@@ -44,7 +44,7 @@ export interface PiAcpAgentOptions {
 }
 
 /** This package's own name and version, reported to the client as `agentInfo`. */
-const PACKAGE: { name: string; version: string } = JSON.parse(
+export const PACKAGE: { name: string; version: string } = JSON.parse(
 	readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
 );
 
@@ -272,6 +272,11 @@ export class PiAcpAgent {
 
 	async cancel(params: CancelNotification): Promise<void> {
 		await this.#sessions.get(params.sessionId)?.cancel();
+	}
+
+	/** Whether a session is open on this connection. */
+	hasSession(sessionId: string): boolean {
+		return this.#sessions.has(sessionId);
 	}
 
 	/** Shut every pi child process down; used when the ACP connection closes. */

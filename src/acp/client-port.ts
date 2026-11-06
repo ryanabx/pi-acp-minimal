@@ -29,6 +29,17 @@ export interface PermissionPrompt {
 
 export type PermissionOutcome = { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 
+/**
+ * What happens to a display terminal: one the client only shows, for a
+ * command pi runs itself. ACP v2 has these as `terminal_update` and
+ * `terminal_output_chunk`; v1 has nothing equivalent.
+ */
+export type TerminalEvent =
+	| { type: "open"; terminalId: string; cwd: string; command?: string }
+	/** Output to append to what the terminal shows. */
+	| { type: "output"; terminalId: string; data: string }
+	| { type: "exit"; terminalId: string; exitCode: number | null };
+
 /** Foreground work as ACP v2 state updates report it. */
 export type ForegroundState =
 	| { state: "running" }
@@ -45,6 +56,13 @@ export type ForegroundState =
 export interface ClientPort {
 	/** What the client supports, in v1 terms. */
 	readonly capabilities: ClientCapabilities | undefined;
+	/**
+	 * Whether shell output goes to a display terminal ({@link terminal}). The
+	 * tool call then refers to it with `{ type: "terminal" }` content instead
+	 * of carrying the output as text.
+	 */
+	readonly displaysTerminals: boolean;
+	terminal(sessionId: string, event: TerminalEvent): Promise<void>;
 	update(sessionId: string, update: SessionUpdate): Promise<void>;
 	/**
 	 * Ask the user to choose an option. Anything but a selection, including a
@@ -69,6 +87,13 @@ export class V1ClientPort implements ClientPort {
 		/** Set once the client has sent `initialize`. */
 		public capabilities: ClientCapabilities | undefined,
 	) {}
+
+	/** v1 terminals are ones the client runs; shell output stays text content. */
+	readonly displaysTerminals = false;
+
+	async terminal(): Promise<void> {
+		// Never called: displaysTerminals is false.
+	}
 
 	async update(sessionId: string, update: SessionUpdate): Promise<void> {
 		await this.client.notify(methods.client.session.update, { sessionId, update });

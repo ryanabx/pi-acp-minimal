@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { Readable, Writable } from "node:stream";
 import { ndJsonStream } from "@agentclientprotocol/sdk";
+import { agentProtocolRouter } from "@agentclientprotocol/sdk/experimental/v2";
 import { createPiAgentApp } from "./acp/agent.js";
+import { createPiAgentAppV2 } from "./acp/v2/app.js";
 import { traceStream } from "./acp/wire-trace.js";
 
 const USAGE = `pi-acp-minimal — Agent Client Protocol adapter for the pi coding agent
@@ -112,11 +114,14 @@ async function main(): Promise<void> {
 	const raw = ndJsonStream(Writable.toWeb(process.stdout), Readable.toWeb(process.stdin));
 	const stream = logFile ? traceStream(raw, logFile) : raw;
 
-	const { app, shutdown: stopPi } = createPiAgentApp({ piCommand, piArgs, log });
-	app.connect(stream);
+	// The client's `initialize` picks the protocol: ACP v1, or the v2 draft for
+	// a client that asks for it. Only the chosen app ever starts a pi process.
+	const v1 = createPiAgentApp({ piCommand, piArgs, log });
+	const v2 = createPiAgentAppV2({ piCommand, piArgs, log });
+	agentProtocolRouter().withV1(v1.app).withV2(v2.app).connect(stream);
 
 	const shutdown = async () => {
-		await stopPi();
+		await Promise.all([v1.shutdown(), v2.shutdown()]);
 		process.exit(0);
 	};
 	process.on("SIGINT", () => void shutdown());

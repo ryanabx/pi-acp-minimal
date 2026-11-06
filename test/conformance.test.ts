@@ -276,6 +276,41 @@ async function sweep(client: TestClient, workspace: string, clientCapabilities: 
 	await new Promise((resolve) => setTimeout(resolve, 200));
 }
 
+/** Drive a v2 client through every scenario and session method the v2 front end serves. */
+async function sweepV2(client: TestClient, workspace: string, capabilities: Record<string, unknown>): Promise<void> {
+	client.permissionAnswer = "yes";
+	client.elicitationAnswer = () => ({ action: "accept", content: { value: "red" } });
+	const idles = () => client.updates.filter((u: any) => u.sessionUpdate === "state_update" && u.stopReason).length;
+
+	await client.request("initialize", { protocolVersion: 2, info: { name: "sweep", version: "0" }, capabilities });
+	const { sessionId } = await client.request<{ sessionId: string }>("session/new", { cwd: workspace });
+	for (const scenario of [...SCENARIOS, "AUTORUN"]) {
+		const before = idles();
+		await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: `${scenario} please` }] });
+		await client.waitFor(() => idles() > before);
+	}
+	// The unprompted run AUTORUN starts.
+	await new Promise((resolve) => setTimeout(resolve, 200));
+
+	const before = idles();
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "SLOW please" }] });
+	await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "agent_message_chunk"));
+	client.cancel(sessionId);
+	await client.waitFor(() => idles() > before);
+
+	await client.request("session/set_config_option", { sessionId, configId: "model", type: "id", value: "openai/gpt-5" });
+	await client.request("session/set_config_option", { sessionId, configId: "nope", type: "id", value: "x" }).catch(() => {});
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }] }).catch(() => {});
+	await client.request("session/list", { cwd: workspace });
+	await client.request("session/resume", { sessionId, cwd: workspace, replayFrom: { type: "start" } });
+	await client.request("session/resume", { sessionId, cwd: workspace });
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "SLOW again" }] });
+	await client.request("session/close", { sessionId });
+	await client.request("session/close", { sessionId });
+	await client.request("session/delete", { sessionId: path.join(workspace, "missing.jsonl") }).catch(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 200));
+}
+
 describe("ACP conformance sweep", () => {
 	it.each([
 		["advertises nothing", {}],
@@ -331,6 +366,56 @@ describe("ACP conformance sweep", () => {
 			expect(kinds.has("compaction_update")).toBe(advertised);
 			expect(client.conformance.checked.has("CreateElicitationRequest")).toBe(advertised);
 			expect(client.conformance.checked.has("ReadTextFileRequest")).toBe(advertised);
+		} finally {
+			cleanup();
+		}
+	}, 60_000);
+
+	it.each([
+		["advertises nothing", {}],
+		["advertises elicitation", { elicitation: { form: {} } }],
+	])("stays within the ACP v2 draft for a client that %s", async (_label, capabilities) => {
+		const { client, workspace, cleanup } = createTestClient({
+			extraArgs: (dir) => ["--session-dir", path.join(dir, "store")],
+		});
+		mkdirSync(path.join(workspace, "store"));
+		try {
+			await sweepV2(client, workspace, capabilities);
+
+			const kinds = new Set(client.updates.map((u) => u.sessionUpdate as string));
+			for (const kind of [
+				"user_message",
+				"agent_message_chunk",
+				"agent_thought_chunk",
+				"agent_message",
+				"state_update",
+				"tool_call_update",
+				"terminal_update",
+				"terminal_output_chunk",
+				"available_commands_update",
+				"config_option_update",
+				"usage_update",
+				"session_info_update",
+				"notice",
+				"compaction_update",
+			]) {
+				expect(kinds, kind).toContain(kind);
+			}
+			for (const definition of [
+				"InitializeResponse",
+				"NewSessionResponse",
+				"ResumeSessionResponse",
+				"ListSessionsResponse",
+				"CloseSessionResponse",
+				"PromptResponse",
+				"SetSessionConfigOptionResponse",
+				"UpdateSessionNotification",
+				"RequestPermissionRequest",
+				"Error",
+			]) {
+				expect(client.conformance.checked, definition).toContain(definition);
+			}
+			expect(client.conformance.checked.has("CreateElicitationRequest")).toBe("elicitation" in capabilities);
 		} finally {
 			cleanup();
 		}
