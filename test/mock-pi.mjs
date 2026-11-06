@@ -199,7 +199,9 @@ async function editScenario() {
 	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-edit", name: "write", arguments: args } });
 
 	write({ type: "tool_execution_start", toolCallId: "call-edit", toolName: "write", args });
-	await sleep(10);
+	// The adapter snapshots the file on tool_execution_start; leave it time to,
+	// even on a loaded machine running the suite in parallel.
+	await sleep(100);
 	writeFileSync(target, "after\n");
 	write({
 		type: "tool_execution_end",
