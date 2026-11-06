@@ -31,8 +31,8 @@ import { toPiMcpServers } from "../map/mcp.js";
 import { PiRpcError } from "../pi/rpc-client.js";
 import { PiSessionStore } from "../pi/session-store.js";
 import { type ClientPort, V1ClientPort } from "./client-port.js";
-import { authRequired, internalError, invalidParams, resourceNotFound } from "./errors.js";
-import { errorMessage, PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
+import { authRequired, errorMessage, internalError, invalidParams, resourceNotFound } from "./errors.js";
+import { PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
 export interface PiAcpAgentOptions {
 	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */

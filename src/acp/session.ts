@@ -1,29 +1,14 @@
-import {
-	type AvailableCommand,
-	type ContentBlock,
-	type ElicitationPropertySchema,
-	type SendRequestOptions,
-	type PermissionOption,
-	type PromptResponse,
-	type SessionConfigOption,
-	type SessionNotification,
-	type ToolCallContent,
-	type ToolCallLocation,
-	type ToolCallStatus,
-	type ToolKind,
-} from "@agentclientprotocol/sdk";
+import type { AvailableCommand, PromptResponse, SessionConfigOption } from "@agentclientprotocol/sdk";
 import { fileURLToPath } from "node:url";
 import { toAcpCommand } from "../map/commands.js";
-import { assistantText, contentToText, toAcpContentBlocks } from "../map/content.js";
+import { assistantText } from "../map/content.js";
 import { buildConfigOptions } from "../map/config.js";
 import { assistantPart, MessageIds } from "../map/message-ids.js";
 import { fromAcpModelId, toAcpModelId } from "../map/models.js";
 import type { PiMcpServerConfig } from "../map/mcp.js";
-import { appendedOutput, isFileMutatingTool, isShellTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
 import { toAcpUsageUpdate } from "../map/usage.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
 import type {
-	PiExtensionUiRequest,
 	PiImageContent,
 	PiMessage,
 	PiModel,
@@ -32,11 +17,13 @@ import type {
 	PiSessionState,
 	PiStopReason,
 	PiThinkingLevel,
-	PiToolResult,
 } from "../pi/rpc-types.js";
 import type { ClientPort, SessionUpdate } from "./client-port.js";
-import { internalError, invalidRequest } from "./errors.js";
+import { errorMessage, internalError, invalidRequest } from "./errors.js";
+import { ExtensionDialogs } from "./extension-dialogs.js";
 import { FileAccess } from "./file-access.js";
+import { type ReplaySession, replayMessage } from "./replay.js";
+import { ToolCalls } from "./tool-calls.js";
 
 /** ACP `session/prompt` stop reasons. */
 type PromptStopReason = PromptResponse["stopReason"];
@@ -54,25 +41,6 @@ export interface PiSessionOptions {
 	/** MCP servers the client supplied, in pi's format, keyed by server name. */
 	mcpServers?: Record<string, PiMcpServerConfig>;
 	log: (message: string) => void;
-}
-
-interface ToolCallState {
-	toolName: string;
-	title: string;
-	kind: ToolKind;
-	status: ToolCallStatus;
-	args?: Record<string, unknown>;
-	locations: ToolCallLocation[];
-	/** File contents captured before an `edit`/`write` ran, for the ACP diff. */
-	oldText?: string | null;
-	filePath?: string;
-	announced: boolean;
-	/**
-	 * Set once the call's output goes to a display terminal: the latest output
-	 * snapshot already sent, which pi's cumulative updates are diffed against
-	 * because the terminal appends whatever it receives.
-	 */
-	terminalOutput?: string;
 }
 
 /** The pi extension that registers client-supplied MCP servers; see the file for why. */
@@ -108,13 +76,12 @@ export class PiSession {
 
 	#port: ClientPort;
 	#client: PiRpcClient;
-	#files!: FileAccess;
 	#log: (message: string) => void;
+	#toolCalls: ToolCalls;
+	#dialogs: ExtensionDialogs;
+	#replaySession: ReplaySession;
 
 	#queue: Promise<void> = Promise.resolve();
-	#toolCalls = new Map<string, ToolCallState>();
-	/** Most recent tool call still executing; extension dialogs attach to it. */
-	#activeToolCallId: string | null = null;
 
 	#turn: { resolve: (reason: PromptStopReason) => void; reject: (error: Error) => void } | null = null;
 	/** Settles once the latest prompt turn has sent its last update. */
@@ -154,6 +121,42 @@ export class PiSession {
 		this.#port = options.client;
 		this.#log = options.log;
 
+		const session = this;
+		this.#toolCalls = new ToolCalls({
+			cwd: this.cwd,
+			// Read lazily: `session/load` can rename the session after construction.
+			get sessionId() {
+				return session.sessionId;
+			},
+			port: this.#port,
+			files: new FileAccess(this.#port, () => this.sessionId),
+			notify: (update) => this.#notify(update),
+		});
+		this.#dialogs = new ExtensionDialogs({
+			get sessionId() {
+				return session.sessionId;
+			},
+			port: this.#port,
+			toolCalls: this.#toolCalls,
+			respond: (response) => this.#client.respondExtensionUi(response),
+			status: (title, statusOptions) => this.#status(title, statusOptions),
+			log: this.#log,
+		});
+		this.#replaySession = {
+			ids: this.#ids,
+			toolCalls: this.#toolCalls,
+			notify: (update) => this.#notify(update),
+			compactionSummary: async (summary) => {
+				if (!this.#tracksCompactions) return;
+				await this.#notify({
+					sessionUpdate: "compaction_update",
+					compactionId: this.#nextCompactionId(),
+					status: "completed",
+					summary: [{ type: "text", text: summary }],
+				});
+			},
+		};
+
 		const args = [...options.piArgs];
 		if (options.resumeSessionFile) args.push("--session", options.resumeSessionFile);
 
@@ -171,7 +174,7 @@ export class PiSession {
 			cwd: options.cwd,
 			env,
 			onEvent: (event) => this.#enqueue(() => this.#handleEvent(event)),
-			onExtensionUiRequest: (request) => this.#enqueue(() => this.#handleExtensionUi(request)),
+			onExtensionUiRequest: (request) => this.#enqueue(() => this.#dialogs.handle(request)),
 			onStderr: (chunk) => this.#log(chunk.trimEnd()),
 			onExit: ({ code, signal, stderr }) => {
 				const error = new Error(`pi exited unexpectedly (code ${code ?? "null"}, signal ${signal ?? "null"})`);
@@ -188,7 +191,6 @@ export class PiSession {
 		const state = await this.#client.request({ type: "get_state" });
 		// The session file doubles as the ACP session id so `session/load` can resume it.
 		this.sessionId = state.sessionFile ?? `${UNPERSISTED_SESSION_PREFIX}${state.sessionId}`;
-		this.#files = new FileAccess(this.#port, () => this.sessionId);
 
 		this.#title = state.sessionName ?? null;
 		await this.refreshModelState(state);
@@ -446,8 +448,7 @@ export class PiSession {
 		this.#sawAgentRun = false;
 		this.#lastStopReason = undefined;
 		this.#lastErrorMessage = undefined;
-		this.#toolCalls.clear();
-		this.#activeToolCallId = null;
+		this.#toolCalls.reset();
 
 		const settled = new Promise<PromptStopReason>((resolve, reject) => {
 			this.#turn = { resolve, reject };
@@ -528,123 +529,7 @@ export class PiSession {
 	async replayHistory(): Promise<void> {
 		const { messages } = await this.#client.request({ type: "get_messages" });
 		for (const message of messages) {
-			await this.#replayMessage(message);
-		}
-	}
-
-	async #replayMessage(message: PiMessage): Promise<void> {
-		switch (message.role) {
-			case "user": {
-				const messageId = this.#ids.user(message);
-				for (const content of toAcpContentBlocks(message.content)) {
-					await this.#notify({ sessionUpdate: "user_message_chunk", messageId, content });
-				}
-				return;
-			}
-			case "assistant": {
-				const base = this.#ids.assistant(message);
-				for (const [index, part] of message.content.entries()) {
-					if (part.type === "text") {
-						if (part.text) {
-							await this.#notify({
-								sessionUpdate: "agent_message_chunk",
-								messageId: assistantPart(base, index),
-								content: { type: "text", text: part.text },
-							});
-						}
-					} else if (part.type === "thinking") {
-						if (part.thinking) {
-							await this.#notify({
-								sessionUpdate: "agent_thought_chunk",
-								messageId: assistantPart(base, index),
-								content: { type: "text", text: part.thinking },
-							});
-						}
-					} else {
-						const args = part.arguments ?? {};
-						// Left in_progress: the matching toolResult message completes it,
-						// and an interrupted session honestly has none.
-						const state: ToolCallState = {
-							toolName: part.name,
-							title: toolTitle(this.cwd, part.name, args),
-							kind: toolKind(part.name),
-							status: "in_progress",
-							args,
-							locations: toolLocations(this.cwd, part.name, args),
-							announced: true,
-						};
-						this.#toolCalls.set(part.id, state);
-						await this.#notify({
-							sessionUpdate: "tool_call",
-							toolCallId: part.id,
-							title: state.title,
-							kind: state.kind,
-							status: state.status,
-							rawInput: args,
-							locations: state.locations,
-						});
-					}
-				}
-				if (message.stopReason === "error" && message.errorMessage) {
-					await this.#notify({
-						sessionUpdate: "agent_message_chunk",
-						messageId: assistantPart(base, "error"),
-						content: { type: "text", text: `\n_pi error: ${message.errorMessage}_\n` },
-					});
-				}
-				return;
-			}
-			case "toolResult": {
-				const state = this.#toolCalls.get(message.toolCallId);
-				if (state && isShellTool(message.toolName) && this.#showsTerminals) {
-					await this.#openTerminal(message.toolCallId, state);
-					return this.#closeTerminal(message.toolCallId, state, message, message.isError === true);
-				}
-				await this.#notify({
-					sessionUpdate: "tool_call_update",
-					toolCallId: message.toolCallId,
-					status: message.isError ? "failed" : "completed",
-					content: toolResultContent({ content: message.content }),
-				});
-				return;
-			}
-			case "bashExecution": {
-				const text = ["Ran `" + message.command + "`", "```", message.output, "```"].join("\n");
-				await this.#notify({
-					sessionUpdate: "user_message_chunk",
-					messageId: this.#ids.bashExecution(message),
-					content: { type: "text", text },
-				});
-				return;
-			}
-
-			case "custom": {
-				// Extension context message. pi shows these only when `display` is
-				// true and converts them to a user message for the model.
-				if (!message.display) return;
-				const messageId = this.#ids.custom(message);
-				for (const content of toAcpContentBlocks(message.content)) {
-					await this.#notify({ sessionUpdate: "user_message_chunk", messageId, content });
-				}
-				return;
-			}
-
-			case "compactionSummary":
-				// A client that tracks compactions shows where one happened; for
-				// anyone else the summary is model context, not transcript.
-				if (!this.#tracksCompactions) return;
-				return this.#notify({
-					sessionUpdate: "compaction_update",
-					compactionId: this.#nextCompactionId(),
-					status: "completed",
-					summary: [{ type: "text", text: message.summary }],
-				});
-
-			default:
-				// system and branchSummary are model context, not transcript: pi
-				// sends them in get_messages but they are not part of the
-				// conversation a client wants reloaded.
-				return;
+			await replayMessage(this.#replaySession, message);
 		}
 	}
 
@@ -691,13 +576,13 @@ export class PiSession {
 				return this.#handleMessageEnd(event.message);
 
 			case "tool_execution_start":
-				return this.#handleToolStart(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
+				return this.#toolCalls.start(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
 
 			case "tool_execution_update":
-				return this.#handleToolUpdate(event.toolCallId, event.partialResult);
+				return this.#toolCalls.update(event.toolCallId, event.partialResult);
 
 			case "tool_execution_end":
-				return this.#handleToolEnd(event.toolCallId, event.result, event.isError);
+				return this.#toolCalls.end(event.toolCallId, event.result, event.isError);
 
 			case "turn_end":
 				// Progressive reporting: a long agentic run fills the context well
@@ -791,31 +676,13 @@ export class PiSession {
 					content: { type: "text", text: event.delta },
 				});
 
-			case "toolcall_start": {
+			case "toolcall_start":
 				// Arguments have not streamed in yet; announce the call so the client can
 				// show it immediately, then refine the title once they arrive.
-				const state: ToolCallState = {
-					toolName: event.toolName,
-					title: toolTitle(this.cwd, event.toolName),
-					kind: toolKind(event.toolName),
-					status: "pending",
-					locations: [],
-					announced: true,
-				};
-				this.#toolCalls.set(event.id, state);
-				return this.#notify({
-					sessionUpdate: "tool_call",
-					toolCallId: event.id,
-					title: state.title,
-					kind: state.kind,
-					status: "pending",
-				});
-			}
+				return this.#toolCalls.announce(event.id, event.toolName);
 
-			case "toolcall_end": {
-				const args = event.toolCall.arguments ?? {};
-				return this.#describeToolCall(event.toolCall.id, event.toolCall.name, args, null);
-			}
+			case "toolcall_end":
+				return this.#toolCalls.describe(event.toolCall.id, event.toolCall.name, event.toolCall.arguments ?? {}, null);
 
 			default:
 				return;
@@ -856,175 +723,6 @@ export class PiSession {
 		const insertion = this.#insertion;
 		this.#insertion = null;
 		insertion?.(messageId);
-	}
-
-	/** Fill in everything derivable from a tool call's complete arguments. */
-	async #describeToolCall(
-		toolCallId: string,
-		toolName: string,
-		args: Record<string, unknown>,
-		status: ToolCallStatus | null,
-	): Promise<void> {
-		const state = this.#toolCalls.get(toolCallId) ?? {
-			toolName,
-			title: toolTitle(this.cwd, toolName, args),
-			kind: toolKind(toolName),
-			status: "pending" as ToolCallStatus,
-			locations: [],
-			announced: false,
-		};
-
-		state.args = args;
-		state.title = toolTitle(this.cwd, toolName, args);
-		state.kind = toolKind(toolName);
-		state.locations = toolLocations(this.cwd, toolName, args);
-		if (status) state.status = status;
-		this.#toolCalls.set(toolCallId, state);
-
-		if (!state.announced) {
-			state.announced = true;
-			return this.#notify({
-				sessionUpdate: "tool_call",
-				toolCallId,
-				title: state.title,
-				kind: state.kind,
-				status: state.status,
-				rawInput: args,
-				locations: state.locations,
-			});
-		}
-
-		return this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			title: state.title,
-			kind: state.kind,
-			status: state.status,
-			rawInput: args,
-			locations: state.locations,
-		});
-	}
-
-	async #handleToolStart(
-		toolCallId: string,
-		toolName: string,
-		args: Record<string, unknown>,
-		parentToolCallId: string | undefined,
-	): Promise<void> {
-		// A call a tool makes through `ctx.executeTool()` still shows as its own
-		// tool call, but the calling tool stays the one a dialog belongs to:
-		// otherwise the nested call's end would leave no active tool call behind.
-		if (!parentToolCallId) this.#activeToolCallId = toolCallId;
-		await this.#describeToolCall(toolCallId, toolName, args, "in_progress");
-
-		const started = this.#toolCalls.get(toolCallId);
-		if (started && isShellTool(toolName) && this.#showsTerminals) await this.#openTerminal(toolCallId, started);
-
-		// Snapshot the file before it changes so the completion can carry a real diff.
-		if (isFileMutatingTool(toolName)) {
-			const state = this.#toolCalls.get(toolCallId);
-			const rawPath = typeof args.path === "string" ? args.path : undefined;
-			if (state && rawPath) {
-				state.filePath = resolvePath(this.cwd, rawPath);
-				state.oldText = await this.#files.readText(state.filePath);
-			}
-		}
-	}
-
-	async #handleToolUpdate(toolCallId: string, partialResult: PiToolResult | undefined): Promise<void> {
-		const state = this.#toolCalls.get(toolCallId);
-		if (state?.terminalOutput !== undefined) {
-			return this.#writeTerminal(toolCallId, state, contentToText(partialResult?.content));
-		}
-		const content = toolResultContent(partialResult);
-		if (content.length === 0) return;
-		return this.#notify({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress", content });
-	}
-
-	async #handleToolEnd(toolCallId: string, result: PiToolResult | undefined, isError: boolean): Promise<void> {
-		if (this.#activeToolCallId === toolCallId) this.#activeToolCallId = null;
-
-		const state = this.#toolCalls.get(toolCallId);
-		if (state) state.status = isError ? "failed" : "completed";
-		if (state?.terminalOutput !== undefined) return this.#closeTerminal(toolCallId, state, result, isError);
-
-		const content: ToolCallContent[] = [];
-		if (state && !isError && isFileMutatingTool(state.toolName) && state.filePath) {
-			const newText = await this.#files.readText(state.filePath);
-			if (newText !== null) {
-				content.push({ type: "diff", path: state.filePath, oldText: state.oldText ?? null, newText });
-			}
-		}
-		if (content.length === 0) content.push(...toolResultContent(result));
-
-		const details = result?.details;
-		await this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			status: isError ? "failed" : "completed",
-			content,
-			...(isPlainObject(details) ? { rawOutput: details } : {}),
-		});
-	}
-
-	// ==========================================================================
-	// Display terminals
-	// ==========================================================================
-	//
-	// A client whose port displays terminals (ACP v2) shows a shell command's
-	// output in a terminal it only displays, named after the tool call; the
-	// tool call refers to it instead of carrying the output as text.
-
-	get #showsTerminals(): boolean {
-		return this.#port.features.displayTerminals;
-	}
-
-	async #openTerminal(toolCallId: string, state: ToolCallState): Promise<void> {
-		if (state.terminalOutput !== undefined) return;
-		state.terminalOutput = "";
-		const command = typeof state.args?.command === "string" ? state.args.command : undefined;
-		// The terminal exists before the tool call refers to it.
-		await this.#port.terminal(this.sessionId, {
-			type: "open",
-			terminalId: toolCallId,
-			cwd: this.cwd,
-			...(command ? { command } : {}),
-		});
-		await this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			content: [{ type: "terminal", terminalId: toolCallId }],
-		});
-	}
-
-	async #writeTerminal(toolCallId: string, state: ToolCallState, snapshot: string): Promise<void> {
-		const data = appendedOutput(state.terminalOutput ?? "", snapshot);
-		state.terminalOutput = snapshot;
-		if (!data) return;
-		await this.#port.terminal(this.sessionId, { type: "output", terminalId: toolCallId, data });
-	}
-
-	async #closeTerminal(
-		toolCallId: string,
-		state: ToolCallState,
-		result: PiToolResult | undefined,
-		isError: boolean,
-	): Promise<void> {
-		// The final text adds pi's status lines ("Command exited with code 2",
-		// truncation notes) after the output already streamed.
-		await this.#writeTerminal(toolCallId, state, contentToText(result?.content));
-		const structured = result?.structuredContent;
-		const reported = isPlainObject(structured) ? structured.exit_code : undefined;
-		const exitCode = typeof reported === "number" ? reported : isError ? null : 0;
-		await this.#port.terminal(this.sessionId, { type: "exit", terminalId: toolCallId, exitCode });
-		const details = result?.details;
-		await this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			status: isError ? "failed" : "completed",
-			content: [{ type: "terminal", terminalId: toolCallId }],
-			...(isPlainObject(details) ? { rawOutput: details } : {}),
-		});
 	}
 
 	async #settleTurn(aborted = false): Promise<void> {
@@ -1068,168 +766,6 @@ export class PiSession {
 			state: "idle",
 			stopReason: aborted ? "cancelled" : ((stopReason && STOP_REASONS[stopReason]) ?? "end_turn"),
 		});
-	}
-
-	// ==========================================================================
-	// Extension UI bridge
-	// ==========================================================================
-
-	async #handleExtensionUi(request: PiExtensionUiRequest): Promise<void> {
-		switch (request.method) {
-			case "notify":
-				return this.#status(request.message, { level: request.notifyType });
-
-			case "confirm":
-				return this.#askPermission(
-					request.id,
-					request.title,
-					request.message,
-					[
-						{ optionId: "yes", name: "Yes", kind: "allow_once" },
-						{ optionId: "no", name: "No", kind: "reject_once" },
-					],
-					(optionId) => ({ type: "extension_ui_response", id: request.id, confirmed: optionId === "yes" }),
-					{ type: "extension_ui_response", id: request.id, confirmed: false },
-					request.timeout,
-				);
-
-			case "select":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						oneOf: request.options.map((option) => ({ const: option, title: option })),
-					}, request.timeout);
-				}
-				// Without elicitation, a choice is rendered as a permission prompt
-				// whose options are pi's choices.
-				return this.#askPermission(
-					request.id,
-					request.title,
-					undefined,
-					request.options.map((option, index) => ({
-						optionId: String(index),
-						name: option,
-						kind: permissionKindFor(option),
-					})),
-					(optionId) => {
-						const value = request.options[Number(optionId)];
-						return value === undefined
-							? { type: "extension_ui_response", id: request.id, cancelled: true }
-							: { type: "extension_ui_response", id: request.id, value };
-					},
-					{ type: "extension_ui_response", id: request.id, cancelled: true },
-					request.timeout,
-				);
-
-			case "input":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						...(request.placeholder ? { description: request.placeholder } : {}),
-					}, request.timeout);
-				}
-				return this.#declineTextInput(request.id, request.title);
-
-			case "editor":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						...(request.prefill ? { default: request.prefill } : {}),
-					});
-				}
-				return this.#declineTextInput(request.id, request.title);
-
-			default:
-				// setStatus / setWidget / setTitle / set_editor_text are TUI chrome.
-				this.#log(`ignoring extension UI request: ${request.method}`);
-				return;
-		}
-	}
-
-	get #supportsFormElicitation(): boolean {
-		return this.#port.features.formElicitation;
-	}
-
-	/**
-	 * Ask the user for one value through an ACP form elicitation, and hand it to pi.
-	 *
-	 * The form has a single required field. It is tied to the running tool
-	 * call, if any, like the permission prompts. When pi gives the dialog a
-	 * timeout, the elicitation is withdrawn once pi has stopped waiting.
-	 */
-	async #elicitText(piRequestId: string, message: string, field: ElicitationPropertySchema, timeout?: number): Promise<void> {
-		const toolCallId = this.#activeToolCallId;
-		// Not awaited: pi is blocked on this dialog, and holding the event queue
-		// would stall any tool output still streaming alongside it.
-		void this.#port
-			.elicit(
-				{
-					mode: "form",
-					sessionId: this.sessionId,
-					...(toolCallId ? { toolCallId } : {}),
-					message,
-					requestedSchema: { type: "object", properties: { value: field }, required: ["value"] },
-				},
-				withTimeout(timeout),
-			)
-			.then(
-				(response) => {
-					const value = response.action === "accept" && isPlainObject(response.content) ? response.content.value : undefined;
-					this.#client.respondExtensionUi(
-						typeof value === "string"
-							? { type: "extension_ui_response", id: piRequestId, value }
-							: { type: "extension_ui_response", id: piRequestId, cancelled: true },
-					);
-				},
-				(error: unknown) => {
-					this.#log(`elicitation failed: ${errorMessage(error)}`);
-					this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
-				},
-			);
-	}
-
-	/** Without elicitation there is no free-text prompt: cancel, and say why. */
-	async #declineTextInput(piRequestId: string, title: string): Promise<void> {
-		// Decline so the extension takes its cancellation path instead of
-		// blocking pi forever.
-		this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
-		return this.#status(`A pi extension asked for text input ("${title}")`, {
-			level: "warning",
-			description: "This client cannot show text prompts (no form elicitation), so the request was cancelled.",
-		});
-	}
-
-	/** Render a pi extension dialog as an ACP permission request, tied to the running tool call if any. */
-	async #askPermission(
-		requestId: string,
-		title: string,
-		description: string | undefined,
-		options: PermissionOption[],
-		toResponse: (optionId: string) => Parameters<PiRpcClient["respondExtensionUi"]>[0],
-		onCancel: Parameters<PiRpcClient["respondExtensionUi"]>[0],
-		/** pi's dialog timeout; the prompt is withdrawn once pi stops waiting. */
-		timeout?: number,
-	): Promise<void> {
-		const toolCallId = this.#activeToolCallId;
-		const toolTitle = toolCallId ? this.#toolCalls.get(toolCallId)?.title : undefined;
-
-		// Not awaited: pi is blocked on this dialog, and holding the event queue
-		// would stall any tool output still streaming alongside it.
-		void this.#port
-			.requestPermission(
-				{
-					sessionId: this.sessionId,
-					dialogId: requestId,
-					title,
-					...(description ? { description } : {}),
-					...(toolCallId ? { toolCall: { toolCallId, ...(toolTitle ? { title: toolTitle } : {}) } } : {}),
-					options,
-				},
-				withTimeout(timeout),
-			)
-			.then((outcome) => {
-				this.#client.respondExtensionUi(outcome.outcome === "selected" ? toResponse(outcome.optionId) : onCancel);
-			});
 	}
 
 	// ==========================================================================
@@ -1310,39 +846,3 @@ export class PiSession {
 }
 
 type AssistantMessageDelta = Extract<PiRpcEvent, { type: "message_update" }>["assistantMessageEvent"];
-
-/** pi tool output -> ACP tool call content blocks. */
-function toolResultContent(result: PiToolResult | undefined): ToolCallContent[] {
-	if (!result) return [];
-	const blocks: ContentBlock[] = toAcpContentBlocks(result.content);
-	return blocks.map((content) => ({ type: "content", content }));
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Guess an ACP permission kind from a pi select option's label. */
-function permissionKindFor(option: string): PermissionOption["kind"] {
-	const lower = option.toLowerCase();
-	const rejecting = /\b(no|deny|denied|reject|block|cancel|skip|never|don't|do not)\b/.test(lower);
-	const always = /\b(always|all|session|remember)\b/.test(lower);
-	if (rejecting) return always ? "reject_always" : "reject_once";
-	return always ? "allow_always" : "allow_once";
-}
-
-/**
- * Withdraw a client prompt (`$/cancel_request`) once pi's own dialog timeout
- * has passed: pi has already resolved the dialog by then.
- */
-function withTimeout(timeout: number | undefined): SendRequestOptions | undefined {
-	if (!timeout || timeout <= 0) return undefined;
-	return { cancellationSignal: AbortSignal.timeout(timeout), stopWaitingOnCancel: true };
-}
-
-export function errorMessage(error: unknown): string {
-	if (error instanceof Error) return error.message;
-	return String(error);
-}
-
-

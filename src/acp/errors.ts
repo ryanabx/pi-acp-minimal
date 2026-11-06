@@ -38,3 +38,8 @@ export function resourceNotFound(message: string, data?: unknown): RequestError 
 export function requestCancelled(message: string): RequestError {
 	return new RequestError(CODES.requestCancelled, message);
 }
+
+export function errorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	return String(error);
+}

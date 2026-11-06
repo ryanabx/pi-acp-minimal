@@ -137,7 +137,10 @@ src/
   cli.ts              entry point: stdio -> protocol router -> the v1 or v2 agent app -> PiAcpAgent
   acp/
     agent.ts          ACP v1 agent app: initialize, session/{new,load,resume,list,delete,close,prompt,cancel,set_config_option}
-    session.ts        one pi process + the RPC-event -> session/update mapping
+    session.ts        one pi process: prompt turns, model state, RPC-event -> session/update mapping
+    tool-calls.ts     pi tool events -> ACP tool calls: titles, diffs, display terminals
+    extension-dialogs.ts  pi extension dialogs -> permission requests and elicitations
+    replay.ts         stored pi messages -> session/update, for session/load and v2 resume
     client-port.ts    what the core needs from the client; V1ClientPort passes it through
     v2/
       app.ts          ACP v2 agent app: v2 requests -> core calls, prompt lifecycle, resume/close
