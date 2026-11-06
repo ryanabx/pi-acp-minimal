@@ -81,10 +81,6 @@ const MCP_EXTENSION = fileURLToPath(new URL("../../pi-extension/acp-mcp-servers.
 /** Session id prefix used when pi runs without session persistence. */
 export const UNPERSISTED_SESSION_PREFIX = "pi-session:";
 
-const IDLE_POLL_MS = 500;
-/** Consecutive idle polls before assuming a prompt produced no agent run. */
-const IDLE_OBSERVATIONS_BEFORE_SETTLE = 3;
-
 /** pi stop reasons that end a turn without more work to do. */
 const STOP_REASONS: Record<PiStopReason, PromptStopReason | undefined> = {
 	stop: "end_turn",
@@ -125,10 +121,6 @@ export class PiSession {
 	#turnDone: Promise<void> = Promise.resolve();
 	#cancelled = false;
 	#sawAgentRun = false;
-	/** What pi reported it did with the current prompt, if anything yet. */
-	#promptDisposition: PiPromptDisposition | undefined;
-	#idleWatchdog: NodeJS.Timeout | null = null;
-	#idleObservations = 0;
 	#lastStopReason: PiStopReason | undefined;
 	#lastErrorMessage: string | undefined;
 	#streamedTextThisMessage = false;
@@ -219,7 +211,6 @@ export class PiSession {
 	async close(): Promise<void> {
 		await this.cancel();
 		await this.stop();
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		this.#turn = null;
 		this.#insertion = null;
@@ -453,7 +444,6 @@ export class PiSession {
 	): Promise<PromptStopReason> {
 		this.#cancelled = false;
 		this.#sawAgentRun = false;
-		this.#promptDisposition = undefined;
 		this.#lastStopReason = undefined;
 		this.#lastErrorMessage = undefined;
 		this.#toolCalls.clear();
@@ -470,14 +460,15 @@ export class PiSession {
 			void this.#port.foreground(this.sessionId, { state: "running" });
 		};
 
+		let disposition: PiPromptDisposition;
 		try {
 			const response = await this.#client.request({
 				type: "prompt",
 				message,
 				images: images.length > 0 ? images : undefined,
 			});
-			// Older pi builds send no `data` on the prompt response.
-			this.#promptDisposition = response?.disposition;
+			// pi before 1.x reports none; its prompts run like started ones.
+			disposition = response?.disposition ?? "started";
 		} catch (error) {
 			this.#turn = null;
 			this.#insertion = null;
@@ -485,20 +476,18 @@ export class PiSession {
 		}
 		// pi stores no user message for a prompt an extension command handled,
 		// and stores a queued one only once it gets to it.
-		if (this.#promptDisposition === "handled" || this.#promptDisposition === "queued") {
+		if (disposition === "handled" || disposition === "queued") {
 			this.#markInserted(this.#ids.unstoredPrompt());
 		}
 
-		if (this.#promptDisposition === "handled" && !this.#sawAgentRun) {
+		// "started" and "queued" end on agent_settled, which pi always emits once
+		// it has started a run.
+		if (disposition === "handled" && !this.#sawAgentRun) {
 			// An extension command or input handler consumed the prompt: pi will
 			// not start a run for it, so there is no agent_settled to wait for.
 			// Queue behind events pi already sent so their updates land first.
 			this.#log('pi reported the prompt "handled" without an agent run; ending turn');
 			this.#enqueue(() => this.#settleTurn());
-		} else {
-			// "started" and "queued" end on agent_settled. The watchdog covers pi
-			// builds that do not report a disposition.
-			this.#startIdleWatchdog();
 		}
 		let stopReason: PromptStopReason;
 		try {
@@ -682,7 +671,6 @@ export class PiSession {
 				}
 				// A real agent run is under way; the turn now ends on `agent_settled`.
 				this.#sawAgentRun = true;
-				this.#stopIdleWatchdog();
 				return;
 
 			case "message_start":
@@ -1039,56 +1027,7 @@ export class PiSession {
 		});
 	}
 
-	/**
-	 * Guard against prompts that never start an agent run.
-	 *
-	 * Extension commands (`/mycommand`) are handled inline by pi and may finish
-	 * without emitting `agent_start`/`agent_settled`, which would leave
-	 * `session/prompt` pending forever. pi reports these as a `"handled"`
-	 * disposition, which ends the turn directly; this is the fallback for pi
-	 * builds that report no disposition and for a reported run that never
-	 * materialises. Poll pi until it has been idle for a few consecutive
-	 * checks, then end the turn ourselves.
-	 */
-	#startIdleWatchdog(): void {
-		this.#stopIdleWatchdog();
-		this.#idleObservations = 0;
-		this.#idleWatchdog = setInterval(() => void this.#pollForIdle(), IDLE_POLL_MS);
-		this.#idleWatchdog.unref?.();
-	}
-
-	#stopIdleWatchdog(): void {
-		if (!this.#idleWatchdog) return;
-		clearInterval(this.#idleWatchdog);
-		this.#idleWatchdog = null;
-	}
-
-	async #pollForIdle(): Promise<void> {
-		if (!this.#turn || this.#sawAgentRun) return this.#stopIdleWatchdog();
-
-		let state: PiSessionState;
-		try {
-			state = await this.#client.request({ type: "get_state" });
-		} catch {
-			return;
-		}
-		if (!this.#turn || this.#sawAgentRun) return this.#stopIdleWatchdog();
-
-		if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) {
-			this.#idleObservations = 0;
-			return;
-		}
-		if (++this.#idleObservations < IDLE_OBSERVATIONS_BEFORE_SETTLE) return;
-
-		this.#stopIdleWatchdog();
-		this.#log(
-			`prompt completed without an agent run (pi reported "${this.#promptDisposition ?? "unknown"}"); ending turn`,
-		);
-		this.#enqueue(() => this.#settleTurn());
-	}
-
 	async #settleTurn(aborted = false): Promise<void> {
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;
@@ -1108,7 +1047,6 @@ export class PiSession {
 	}
 
 	#failTurn(error: Error): void {
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;

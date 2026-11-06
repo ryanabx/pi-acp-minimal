@@ -376,9 +376,10 @@ once pi has stopped waiting for it.
 - **Session modes** (`session/set_mode`) are not used. pi has no operating
   modes, and its thinking level is a better fit for the `thought_level` config
   option category.
-- **Prompts that only run an extension command** never start a pi agent run and
-  so never emit `agent_settled`. The adapter polls `get_state` and ends the turn
-  once pi has been idle for ~1.5s.
+- **pi 1.x or later.** The adapter relies on the disposition pi reports for
+  each prompt: a prompt an extension command handled ends its turn at once,
+  and any other ends on `agent_settled`. Older pi builds report none, and an
+  extension command sent through them would leave its turn waiting.
 - **Model metadata is only as good as pi's.** Context windows in particular come
   straight from the provider: llama.cpp reports none for an unloaded model, and
   pi substitutes a 128k default until the model is loaded. The adapter re-reads
