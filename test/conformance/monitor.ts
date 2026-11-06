@@ -1,9 +1,11 @@
-import { methods, validate } from "./acp-schema.js";
+import { methods, type ProtocolVersion, validate } from "./acp-schema.js";
 
 /**
  * Watches one ACP connection from the client's side and records every way the
- * traffic breaks ACP v1: schema violations, in both directions, plus the
- * protocol rules a schema cannot express.
+ * traffic breaks ACP: schema violations, in both directions, plus the
+ * protocol rules a schema cannot express. The protocol version is the one the
+ * client's `initialize` asks for (the agent may not answer with a newer one):
+ * ACP v1, or the stable feature set of the v2 draft.
  *
  * Feed it every frame the client writes (`fromClient`) and every frame the
  * agent writes (`fromAgent`), in wire order. Client frames are checked too, so
@@ -19,7 +21,10 @@ export interface Violation {
 type Frame = Record<string, unknown>;
 type Id = string | number;
 
-/** Session updates and requests a client may only receive after advertising a capability. */
+/** v1 session updates v2 replaced: tool calls are created by `tool_call_update`, plans by `plan_update`. */
+const V1_ONLY_UPDATES = new Set(["tool_call", "plan", "current_mode_update"]);
+
+/** v1 session updates and requests a client may only receive after advertising a capability. */
 const UPDATE_CAPABILITIES: Record<string, (caps: Capabilities) => boolean> = {
 	notice: (caps) => caps.session?.notices != null,
 	compaction_update: (caps) => caps.session?.compaction != null,
@@ -39,7 +44,13 @@ export class ConformanceMonitor {
 	readonly checked = new Set<string>();
 
 	#capabilities: Capabilities = {};
+	#version: ProtocolVersion = 1;
 	#initialized = false;
+	/** v2: user message ids echoed per session, and prompt answers still waiting for their echo. */
+	#userMessages = new Map<string, Set<string>>();
+	#awaitingEcho = new Map<string, string>();
+	/** v2: `session/resume` requests in flight, and whether a state update came for each. */
+	#resumes = new Map<Id, { sessionId: string; stateSent: boolean }>();
 	/** Client requests awaiting a response: id -> method (and params, for session bookkeeping). */
 	#clientRequests = new Map<Id, { method: string; params: Frame }>();
 	/** Agent requests awaiting the client's response: id -> method. */
@@ -60,10 +71,16 @@ export class ConformanceMonitor {
 		if (typeof message.method === "string" && "id" in message) {
 			const id = message.id as Id;
 			const params = (message.params ?? {}) as Frame;
-			this.#check("client→agent", methods.agentRequests, message.method, params, "request params");
-			this.#clientRequests.set(id, { method: message.method, params });
 			if (message.method === "initialize") {
-				this.#capabilities = ((params as { clientCapabilities?: Capabilities }).clientCapabilities ?? {}) as Capabilities;
+				const requested = (params as { protocolVersion?: unknown }).protocolVersion;
+				this.#version = typeof requested === "number" && requested >= 2 ? 2 : 1;
+				const capabilities = this.#version === 2 ? params.capabilities : params.clientCapabilities;
+				this.#capabilities = (capabilities ?? {}) as Capabilities;
+			}
+			this.#check("client→agent", this.#methods.agentRequests, message.method, params, "request params");
+			this.#clientRequests.set(id, { method: message.method, params });
+			if (this.#version === 2 && message.method === "session/resume" && typeof params.sessionId === "string") {
+				this.#resumes.set(id, { sessionId: params.sessionId, stateSent: false });
 			}
 			// The client names these sessions itself, so it knows them already.
 			if (
@@ -73,13 +90,13 @@ export class ConformanceMonitor {
 				this.#openSession(params.sessionId);
 			}
 		} else if (typeof message.method === "string") {
-			this.#check("client→agent", methods.agentNotifications, message.method, message.params ?? {}, "notification params");
+			this.#check("client→agent", this.#methods.agentNotifications, message.method, message.params ?? {}, "notification params");
 		} else if ("id" in message) {
 			const method = this.#agentRequests.get(message.id as Id);
 			if (method === undefined) {
 				this.#violation("client→agent", "response-id", `response to unknown agent request ${String(message.id)}`);
 			} else if ("result" in message) {
-				this.#check("client→agent", methods.clientResponses, method, message.result, "response result");
+				this.#check("client→agent", this.#methods.clientResponses, method, message.result, "response result");
 			}
 			this.#agentRequests.delete(message.id as Id);
 		}
@@ -102,25 +119,25 @@ export class ConformanceMonitor {
 				this.#violation("agent→client", "request-id", `request id ${String(message.id)} reused while still pending`);
 			}
 			this.#agentRequests.set(message.id as Id, method);
-			if (!method.startsWith("_") && !methods.clientRequests.has(method)) {
+			if (!method.startsWith("_") && !this.#methods.clientRequests.has(method)) {
 				this.#violation("agent→client", "unknown-method", `request for unknown client method ${method}`);
 				return;
 			}
-			this.#check("agent→client", methods.clientRequests, method, params, "request params");
+			this.#check("agent→client", this.#methods.clientRequests, method, params, "request params");
 			this.#checkClientMethodAllowed(method, params);
 			if (typeof params.sessionId === "string") this.#checkSessionAddressable(method, params.sessionId);
-			if (method === "session/request_permission") this.#checkToolCallKnown(params, "toolCall");
+			if (method === "session/request_permission" && this.#version === 1) this.#checkToolCallKnown(params, "toolCall");
 			return;
 		}
 
 		if (isNotification) {
 			const method = message.method as string;
 			const params = (message.params ?? {}) as Frame;
-			if (!method.startsWith("_") && !methods.clientNotifications.has(method)) {
+			if (!method.startsWith("_") && !this.#methods.clientNotifications.has(method)) {
 				this.#violation("agent→client", "unknown-method", `notification for unknown method ${method}`);
 				return;
 			}
-			this.#check("agent→client", methods.clientNotifications, method, params, "notification params");
+			this.#check("agent→client", this.#methods.clientNotifications, method, params, "notification params");
 			if (method === "session/update") this.#checkSessionUpdate(params);
 			if (method === "$/cancel_request" && !this.#agentRequestKnown(params.requestId)) {
 				this.#violation("agent→client", "cancel-request", `$/cancel_request for a request the agent never sent`);
@@ -140,8 +157,10 @@ export class ConformanceMonitor {
 		}
 		this.#clientRequests.delete(message.id as Id);
 
+		const resume = this.#resumes.get(message.id as Id);
+		this.#resumes.delete(message.id as Id);
 		if ("error" in message) {
-			const errors = validate("Error", message.error);
+			const errors = validate(this.#version, "Error", message.error);
 			this.checked.add("Error");
 			if (errors.length > 0) this.#violation("agent→client", "schema", `error for ${pending.method}: ${errors.join("; ")}`);
 			return;
@@ -150,11 +169,29 @@ export class ConformanceMonitor {
 			this.#violation("agent→client", "framing", `response to ${pending.method} has neither result nor error`);
 			return;
 		}
-		this.#check("agent→client", methods.agentResponses, pending.method, message.result, "response result");
-		this.#afterResponse(pending.method, pending.params, message.result as Frame);
+		this.#check("agent→client", this.#methods.agentResponses, pending.method, message.result, "response result");
+		if (resume && !resume.stateSent) {
+			this.#violation("agent→client", "state", `session/resume of ${resume.sessionId} answered without a state_update first`);
+		}
+		this.#afterResponse(pending.method, pending.params, message.result as Frame, message.id as Id);
 	}
 
-	#afterResponse(method: string, params: Frame, result: Frame): void {
+	/**
+	 * Rules that can only be judged once the exchange is over: every v2 prompt
+	 * the agent accepted must have been echoed as a user message.
+	 */
+	finish(): void {
+		for (const [messageId, sessionId] of this.#awaitingEcho) {
+			this.#violation("agent→client", "user-message", `prompt ${messageId} in session ${sessionId} was accepted but never echoed as a user message`);
+		}
+		this.#awaitingEcho.clear();
+	}
+
+	get #methods() {
+		return methods[this.#version];
+	}
+
+	#afterResponse(method: string, params: Frame, result: Frame, id: Id): void {
 		switch (method) {
 			case "initialize": {
 				this.#initialized = true;
@@ -167,6 +204,13 @@ export class ConformanceMonitor {
 			}
 			case "session/new":
 				if (typeof result.sessionId === "string") this.#openSession(result.sessionId);
+				return;
+			case "session/prompt":
+				if (this.#version === 2 && typeof result.messageId === "string" && typeof params.sessionId === "string") {
+					if (!this.#userMessagesOf(params.sessionId).has(result.messageId)) {
+						this.#awaitingEcho.set(result.messageId, params.sessionId);
+					}
+				}
 				return;
 			case "session/close":
 			case "session/delete":
@@ -185,6 +229,7 @@ export class ConformanceMonitor {
 		this.#checkSessionAddressable(`session/update (${String(update.sessionUpdate)})`, sessionId);
 
 		const kind = String(update.sessionUpdate);
+		if (this.#version === 2) return this.#checkV2SessionUpdate(sessionId, kind, update);
 		const allowed = UPDATE_CAPABILITIES[kind];
 		if (allowed && !allowed(this.#capabilities)) {
 			this.#violation("agent→client", "capability", `${kind} sent to a client that did not advertise support for it`);
@@ -193,6 +238,28 @@ export class ConformanceMonitor {
 		const calls = this.#toolCallsOf(sessionId);
 		if (kind === "tool_call" && typeof update.toolCallId === "string") calls.add(update.toolCallId);
 		if (kind === "tool_call_update") this.#checkToolCallKnown({ sessionId, toolCall: update }, "toolCall");
+	}
+
+	#checkV2SessionUpdate(sessionId: string, kind: string, update: Frame): void {
+		if (V1_ONLY_UPDATES.has(kind)) {
+			this.#violation("agent→client", "version", `${kind} is an ACP v1 update; v2 has no such update`);
+		}
+		if ((kind === "user_message" || kind === "user_message_chunk") && typeof update.messageId === "string") {
+			this.#userMessagesOf(sessionId).add(update.messageId);
+			this.#awaitingEcho.delete(update.messageId);
+		}
+		if (kind === "state_update") {
+			for (const resume of this.#resumes.values()) if (resume.sessionId === sessionId) resume.stateSent = true;
+		}
+	}
+
+	#userMessagesOf(sessionId: string): Set<string> {
+		let ids = this.#userMessages.get(sessionId);
+		if (!ids) {
+			ids = new Set();
+			this.#userMessages.set(sessionId, ids);
+		}
+		return ids;
 	}
 
 	/** A tool call update must refer to a tool call the client was told about. */
@@ -285,7 +352,7 @@ export class ConformanceMonitor {
 			return;
 		}
 		this.checked.add(definition);
-		const errors = validate(definition, value);
+		const errors = validate(this.#version, definition, value);
 		if (errors.length > 0) this.#violation(direction, "schema", `${method} ${what} is not a valid ${definition}: ${errors.join("; ")}`);
 	}
 

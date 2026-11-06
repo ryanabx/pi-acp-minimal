@@ -3,7 +3,7 @@ import { toAcpCommand } from "../src/map/commands.js";
 import { contentToText, toAcpContentBlocks, toPiPrompt, uriToPath } from "../src/map/content.js";
 import { buildConfigOptions, isThinkingLevel, modelConfigOption, thinkingConfigOption } from "../src/map/config.js";
 import { describeModel, fromAcpModelId, toAcpModelId } from "../src/map/models.js";
-import { displayPath, isFileMutatingTool, toolKind, toolLocations, toolTitle } from "../src/map/tools.js";
+import { appendedOutput, displayPath, isFileMutatingTool, toolKind, toolLocations, toolTitle } from "../src/map/tools.js";
 import { toAcpUsageUpdate } from "../src/map/usage.js";
 
 describe("prompt content", () => {
@@ -229,5 +229,24 @@ describe("usage", () => {
 		// pi nulls these out between compaction and the next assistant response.
 		expect(toAcpUsageUpdate({ ...base, contextUsage: { tokens: null, contextWindow: 200_000, percent: null } })).toBeNull();
 		expect(toAcpUsageUpdate({ ...base, contextUsage: { tokens: 10, contextWindow: 0, percent: 0 } })).toBeNull();
+	});
+});
+
+describe("appendedOutput", () => {
+	it("returns what a cumulative snapshot adds", () => {
+		expect(appendedOutput("", "a\n")).toBe("a\n");
+		expect(appendedOutput("a\n", "a\nb\n")).toBe("b\n");
+		expect(appendedOutput("a\n", "a\n")).toBe("");
+	});
+
+	it("follows a snapshot truncated to its tail", () => {
+		const lines = (from: number, to: number) =>
+			Array.from({ length: to - from + 1 }, (_, i) => `output line ${from + i}\n`).join("");
+		// pi keeps only the tail once output passes its limit.
+		expect(appendedOutput(lines(1, 30), lines(11, 32))).toBe(lines(31, 32));
+	});
+
+	it("sends the whole snapshot when nothing overlaps", () => {
+		expect(appendedOutput("old", "new")).toBe("new");
 	});
 });

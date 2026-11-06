@@ -1,31 +1,14 @@
-import {
-	type AgentContext,
-	type AvailableCommand,
-	type ClientCapabilities,
-	type ContentBlock,
-	type ElicitationPropertySchema,
-	methods,
-	type SendRequestOptions,
-	type PermissionOption,
-	type PromptResponse,
-	type SessionConfigOption,
-	type SessionNotification,
-	type ToolCallContent,
-	type ToolCallLocation,
-	type ToolCallStatus,
-	type ToolKind,
-} from "@agentclientprotocol/sdk";
+import type { AvailableCommand, PromptResponse, SessionConfigOption } from "@agentclientprotocol/sdk";
 import { fileURLToPath } from "node:url";
 import { toAcpCommand } from "../map/commands.js";
-import { assistantText, toAcpContentBlocks } from "../map/content.js";
+import { assistantText } from "../map/content.js";
 import { buildConfigOptions } from "../map/config.js";
+import { assistantPart, MessageIds } from "../map/message-ids.js";
 import { fromAcpModelId, toAcpModelId } from "../map/models.js";
 import type { PiMcpServerConfig } from "../map/mcp.js";
-import { isFileMutatingTool, resolvePath, toolKind, toolLocations, toolTitle } from "../map/tools.js";
 import { toAcpUsageUpdate } from "../map/usage.js";
 import { PiRpcClient } from "../pi/rpc-client.js";
 import type {
-	PiExtensionUiRequest,
 	PiImageContent,
 	PiMessage,
 	PiModel,
@@ -34,18 +17,20 @@ import type {
 	PiSessionState,
 	PiStopReason,
 	PiThinkingLevel,
-	PiToolResult,
 } from "../pi/rpc-types.js";
-import { internalError, invalidRequest } from "./errors.js";
+import type { ClientPort, SessionUpdate } from "./client-port.js";
+import { errorMessage, internalError, invalidRequest } from "./errors.js";
+import { ExtensionDialogs } from "./extension-dialogs.js";
 import { FileAccess } from "./file-access.js";
+import { type ReplaySession, replayMessage } from "./replay.js";
+import { ToolCalls } from "./tool-calls.js";
 
 /** ACP `session/prompt` stop reasons. */
 type PromptStopReason = PromptResponse["stopReason"];
 
 export interface PiSessionOptions {
 	/** Calls back into the ACP client for the lifetime of the connection. */
-	client: AgentContext;
-	clientCapabilities: ClientCapabilities | undefined;
+	client: ClientPort;
 	cwd: string;
 	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
 	piCommand?: string;
@@ -58,28 +43,11 @@ export interface PiSessionOptions {
 	log: (message: string) => void;
 }
 
-interface ToolCallState {
-	toolName: string;
-	title: string;
-	kind: ToolKind;
-	status: ToolCallStatus;
-	args?: Record<string, unknown>;
-	locations: ToolCallLocation[];
-	/** File contents captured before an `edit`/`write` ran, for the ACP diff. */
-	oldText?: string | null;
-	filePath?: string;
-	announced: boolean;
-}
-
 /** The pi extension that registers client-supplied MCP servers; see the file for why. */
 const MCP_EXTENSION = fileURLToPath(new URL("../../pi-extension/acp-mcp-servers.js", import.meta.url));
 
 /** Session id prefix used when pi runs without session persistence. */
 export const UNPERSISTED_SESSION_PREFIX = "pi-session:";
-
-const IDLE_POLL_MS = 500;
-/** Consecutive idle polls before assuming a prompt produced no agent run. */
-const IDLE_OBSERVATIONS_BEFORE_SETTLE = 3;
 
 /** pi stop reasons that end a turn without more work to do. */
 const STOP_REASONS: Record<PiStopReason, PromptStopReason | undefined> = {
@@ -106,27 +74,30 @@ export class PiSession {
 	readonly cwd: string;
 	sessionId!: string;
 
-	#acp: AgentContext;
-	#clientCapabilities: ClientCapabilities | undefined;
+	#port: ClientPort;
 	#client: PiRpcClient;
-	#files!: FileAccess;
 	#log: (message: string) => void;
+	#toolCalls: ToolCalls;
+	#dialogs: ExtensionDialogs;
+	#replaySession: ReplaySession;
 
 	#queue: Promise<void> = Promise.resolve();
-	#toolCalls = new Map<string, ToolCallState>();
-	/** Most recent tool call still executing; extension dialogs attach to it. */
-	#activeToolCallId: string | null = null;
 
 	#turn: { resolve: (reason: PromptStopReason) => void; reject: (error: Error) => void } | null = null;
+	/** Settles once the latest prompt turn has sent its last update. */
+	#turnDone: Promise<void> = Promise.resolve();
 	#cancelled = false;
 	#sawAgentRun = false;
-	/** What pi reported it did with the current prompt, if anything yet. */
-	#promptDisposition: PiPromptDisposition | undefined;
-	#idleWatchdog: NodeJS.Timeout | null = null;
-	#idleObservations = 0;
 	#lastStopReason: PiStopReason | undefined;
 	#lastErrorMessage: string | undefined;
 	#streamedTextThisMessage = false;
+	#ids = new MessageIds();
+	/** Base message id of the assistant message pi is streaming. */
+	#assistantMessageId: string | null = null;
+	/** Reports the prompt's user message id once pi has added it to the conversation. */
+	#insertion: ((messageId: string) => void) | null = null;
+	/** pi is running without a prompt from the client, e.g. on a queued follow-up. */
+	#unpromptedRun = false;
 
 	#models: PiModel[] = [];
 	#currentModelId: string | undefined;
@@ -147,9 +118,44 @@ export class PiSession {
 
 	constructor(options: PiSessionOptions) {
 		this.cwd = options.cwd;
-		this.#acp = options.client;
-		this.#clientCapabilities = options.clientCapabilities;
+		this.#port = options.client;
 		this.#log = options.log;
+
+		const session = this;
+		this.#toolCalls = new ToolCalls({
+			cwd: this.cwd,
+			// Read lazily: `session/load` can rename the session after construction.
+			get sessionId() {
+				return session.sessionId;
+			},
+			port: this.#port,
+			files: new FileAccess(this.#port, () => this.sessionId),
+			notify: (update) => this.#notify(update),
+		});
+		this.#dialogs = new ExtensionDialogs({
+			get sessionId() {
+				return session.sessionId;
+			},
+			port: this.#port,
+			toolCalls: this.#toolCalls,
+			respond: (response) => this.#client.respondExtensionUi(response),
+			status: (title, statusOptions) => this.#status(title, statusOptions),
+			log: this.#log,
+		});
+		this.#replaySession = {
+			ids: this.#ids,
+			toolCalls: this.#toolCalls,
+			notify: (update) => this.#notify(update),
+			compactionSummary: async (summary) => {
+				if (!this.#tracksCompactions) return;
+				await this.#notify({
+					sessionUpdate: "compaction_update",
+					compactionId: this.#nextCompactionId(),
+					status: "completed",
+					summary: [{ type: "text", text: summary }],
+				});
+			},
+		};
 
 		const args = [...options.piArgs];
 		if (options.resumeSessionFile) args.push("--session", options.resumeSessionFile);
@@ -168,7 +174,7 @@ export class PiSession {
 			cwd: options.cwd,
 			env,
 			onEvent: (event) => this.#enqueue(() => this.#handleEvent(event)),
-			onExtensionUiRequest: (request) => this.#enqueue(() => this.#handleExtensionUi(request)),
+			onExtensionUiRequest: (request) => this.#enqueue(() => this.#dialogs.handle(request)),
 			onStderr: (chunk) => this.#log(chunk.trimEnd()),
 			onExit: ({ code, signal, stderr }) => {
 				const error = new Error(`pi exited unexpectedly (code ${code ?? "null"}, signal ${signal ?? "null"})`);
@@ -185,7 +191,6 @@ export class PiSession {
 		const state = await this.#client.request({ type: "get_state" });
 		// The session file doubles as the ACP session id so `session/load` can resume it.
 		this.sessionId = state.sessionFile ?? `${UNPERSISTED_SESSION_PREFIX}${state.sessionId}`;
-		this.#files = new FileAccess(this.#acp, this.#clientCapabilities, () => this.sessionId);
 
 		this.#title = state.sessionName ?? null;
 		await this.refreshModelState(state);
@@ -203,14 +208,16 @@ export class PiSession {
 	 *
 	 * Once pi is gone no `agent_settled` can arrive, so a turn still waiting on
 	 * one ends here as cancelled rather than hanging its `session/prompt`.
+	 * Resolves once that turn has sent its last update.
 	 */
 	async close(): Promise<void> {
 		await this.cancel();
 		await this.stop();
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		this.#turn = null;
+		this.#insertion = null;
 		turn?.resolve("cancelled");
+		await this.#turnDone;
 	}
 
 	/**
@@ -405,55 +412,108 @@ export class PiSession {
 	// Prompt turn
 	// ==========================================================================
 
-	async prompt(message: string, images: PiImageContent[]): Promise<PromptStopReason> {
+	/**
+	 * Run one prompt turn, resolving with its stop reason once pi has settled.
+	 *
+	 * `onInserted` is called with the id of the prompt's user message as soon as
+	 * pi has added it to the conversation, before the turn ends; ACP v2 answers
+	 * `session/prompt` at that point. It is not called when the prompt fails or
+	 * is cancelled before pi takes it.
+	 */
+	async prompt(
+		message: string,
+		images: PiImageContent[],
+		{ onInserted }: { onInserted?: (messageId: string) => void } = {},
+	): Promise<PromptStopReason> {
 		if (this.#turn) throw invalidRequest("A prompt turn is already in progress for this session");
+		const turn = this.#runTurn(message, images, onInserted);
+		this.#turnDone = turn.then(
+			() => undefined,
+			() => undefined,
+		);
+		return turn;
+	}
 
+	/**
+	 * One prompt turn. Once pi has taken the prompt the turn is foreground work:
+	 * reported `running` then, and `idle` with its stop reason after the last
+	 * update it causes.
+	 */
+	async #runTurn(
+		message: string,
+		images: PiImageContent[],
+		onInserted: ((messageId: string) => void) | undefined,
+	): Promise<PromptStopReason> {
 		this.#cancelled = false;
 		this.#sawAgentRun = false;
-		this.#promptDisposition = undefined;
 		this.#lastStopReason = undefined;
 		this.#lastErrorMessage = undefined;
-		this.#toolCalls.clear();
-		this.#activeToolCallId = null;
+		this.#toolCalls.reset();
 
 		const settled = new Promise<PromptStopReason>((resolve, reject) => {
 			this.#turn = { resolve, reject };
 		});
+		let inserted = false;
+		this.#insertion = (messageId) => {
+			inserted = true;
+			onInserted?.(messageId);
+			// Not awaited: sent at once, ahead of whatever the turn sends next.
+			void this.#port.foreground(this.sessionId, { state: "running" });
+		};
 
+		let disposition: PiPromptDisposition;
 		try {
 			const response = await this.#client.request({
 				type: "prompt",
 				message,
 				images: images.length > 0 ? images : undefined,
 			});
-			// Older pi builds send no `data` on the prompt response.
-			this.#promptDisposition = response?.disposition;
+			// pi before 1.x reports none; its prompts run like started ones.
+			disposition = response?.disposition ?? "started";
 		} catch (error) {
 			this.#turn = null;
+			this.#insertion = null;
 			throw internalError(errorMessage(error));
 		}
+		// pi stores no user message for a prompt an extension command handled,
+		// and stores a queued one only once it gets to it.
+		if (disposition === "handled" || disposition === "queued") {
+			this.#markInserted(this.#ids.unstoredPrompt());
+		}
 
-		if (this.#promptDisposition === "handled" && !this.#sawAgentRun) {
+		// "started" and "queued" end on agent_settled, which pi always emits once
+		// it has started a run.
+		if (disposition === "handled" && !this.#sawAgentRun) {
 			// An extension command or input handler consumed the prompt: pi will
 			// not start a run for it, so there is no agent_settled to wait for.
 			// Queue behind events pi already sent so their updates land first.
 			this.#log('pi reported the prompt "handled" without an agent run; ending turn');
 			this.#enqueue(() => this.#settleTurn());
-		} else {
-			// "started" and "queued" end on agent_settled. The watchdog covers pi
-			// builds that do not report a disposition.
-			this.#startIdleWatchdog();
 		}
-		const stopReason = await settled;
+		let stopReason: PromptStopReason;
+		try {
+			stopReason = await settled;
+		} catch (error) {
+			if (inserted) {
+				const code = typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : -32603;
+				await this.#port.foreground(this.sessionId, {
+					state: "idle",
+					stopReason: "error",
+					error: { code, message: errorMessage(error) },
+				});
+			}
+			throw error;
+		}
 		await this.publishCommands();
 		await this.publishConfigOptions();
 		await this.publishUsage();
+		if (inserted) await this.#port.foreground(this.sessionId, { state: "idle", stopReason });
 		return stopReason;
 	}
 
 	async cancel(): Promise<void> {
-		if (!this.#turn) return;
-		this.#cancelled = true;
+		if (!this.#turn && !this.#unpromptedRun) return;
+		if (this.#turn) this.#cancelled = true;
 		try {
 			await this.#client.request({ type: "abort" });
 		} catch (error) {
@@ -469,105 +529,7 @@ export class PiSession {
 	async replayHistory(): Promise<void> {
 		const { messages } = await this.#client.request({ type: "get_messages" });
 		for (const message of messages) {
-			await this.#replayMessage(message);
-		}
-	}
-
-	async #replayMessage(message: PiMessage): Promise<void> {
-		switch (message.role) {
-			case "user": {
-				for (const content of toAcpContentBlocks(message.content)) {
-					await this.#notify({ sessionUpdate: "user_message_chunk", content });
-				}
-				return;
-			}
-			case "assistant": {
-				for (const part of message.content) {
-					if (part.type === "text") {
-						if (part.text) {
-							await this.#notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: part.text } });
-						}
-					} else if (part.type === "thinking") {
-						if (part.thinking) {
-							await this.#notify({
-								sessionUpdate: "agent_thought_chunk",
-								content: { type: "text", text: part.thinking },
-							});
-						}
-					} else {
-						const args = part.arguments ?? {};
-						// Left in_progress: the matching toolResult message completes it,
-						// and an interrupted session honestly has none.
-						const state: ToolCallState = {
-							toolName: part.name,
-							title: toolTitle(this.cwd, part.name, args),
-							kind: toolKind(part.name),
-							status: "in_progress",
-							args,
-							locations: toolLocations(this.cwd, part.name, args),
-							announced: true,
-						};
-						this.#toolCalls.set(part.id, state);
-						await this.#notify({
-							sessionUpdate: "tool_call",
-							toolCallId: part.id,
-							title: state.title,
-							kind: state.kind,
-							status: state.status,
-							rawInput: args,
-							locations: state.locations,
-						});
-					}
-				}
-				if (message.stopReason === "error" && message.errorMessage) {
-					await this.#notify({
-						sessionUpdate: "agent_message_chunk",
-						content: { type: "text", text: `\n_pi error: ${message.errorMessage}_\n` },
-					});
-				}
-				return;
-			}
-			case "toolResult": {
-				await this.#notify({
-					sessionUpdate: "tool_call_update",
-					toolCallId: message.toolCallId,
-					status: message.isError ? "failed" : "completed",
-					content: toolResultContent({ content: message.content }),
-				});
-				return;
-			}
-			case "bashExecution": {
-				const text = ["Ran `" + message.command + "`", "```", message.output, "```"].join("\n");
-				await this.#notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
-				return;
-			}
-
-			case "custom": {
-				// Extension context message. pi shows these only when `display` is
-				// true and converts them to a user message for the model.
-				if (!message.display) return;
-				for (const content of toAcpContentBlocks(message.content)) {
-					await this.#notify({ sessionUpdate: "user_message_chunk", content });
-				}
-				return;
-			}
-
-			case "compactionSummary":
-				// A client that tracks compactions shows where one happened; for
-				// anyone else the summary is model context, not transcript.
-				if (!this.#tracksCompactions) return;
-				return this.#notify({
-					sessionUpdate: "compaction_update",
-					compactionId: this.#nextCompactionId(),
-					status: "completed",
-					summary: [{ type: "text", text: message.summary }],
-				});
-
-			default:
-				// system and branchSummary are model context, not transcript: pi
-				// sends them in get_messages but they are not part of the
-				// conversation a client wants reloaded.
-				return;
+			await replayMessage(this.#replaySession, message);
 		}
 	}
 
@@ -584,13 +546,27 @@ export class PiSession {
 	async #handleEvent(event: PiRpcEvent): Promise<void> {
 		switch (event.type) {
 			case "agent_start":
+				if (!this.#turn) {
+					// Nobody prompted for this run: a queued follow-up, or an extension
+					// that started one.
+					this.#unpromptedRun = true;
+					this.#lastStopReason = undefined;
+					this.#lastErrorMessage = undefined;
+					return this.#port.foreground(this.sessionId, { state: "running" });
+				}
 				// A real agent run is under way; the turn now ends on `agent_settled`.
 				this.#sawAgentRun = true;
-				this.#stopIdleWatchdog();
 				return;
 
 			case "message_start":
-				if (event.message.role === "assistant") this.#streamedTextThisMessage = false;
+				if (event.message.role === "user") {
+					this.#markInserted(this.#ids.user(event.message));
+				} else if (event.message.role === "assistant") {
+					// pi answering without a user message of its own means it stored none.
+					this.#markInserted(this.#ids.unstoredPrompt());
+					this.#streamedTextThisMessage = false;
+					this.#assistantMessageId = this.#ids.assistant(event.message);
+				}
 				return;
 
 			case "message_update":
@@ -600,13 +576,13 @@ export class PiSession {
 				return this.#handleMessageEnd(event.message);
 
 			case "tool_execution_start":
-				return this.#handleToolStart(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
+				return this.#toolCalls.start(event.toolCallId, event.toolName, event.args, event.parentToolCallId);
 
 			case "tool_execution_update":
-				return this.#handleToolUpdate(event.toolCallId, event.partialResult);
+				return this.#toolCalls.update(event.toolCallId, event.partialResult);
 
 			case "tool_execution_end":
-				return this.#handleToolEnd(event.toolCallId, event.result, event.isError);
+				return this.#toolCalls.end(event.toolCallId, event.result, event.isError);
 
 			case "turn_end":
 				// Progressive reporting: a long agentic run fills the context well
@@ -614,6 +590,7 @@ export class PiSession {
 				return this.publishUsage();
 
 			case "agent_settled":
+				if (this.#unpromptedRun) await this.#settleUnpromptedRun(event.aborted === true);
 				return this.#settleTurn(event.aborted === true);
 
 			case "compaction_start":
@@ -685,37 +662,27 @@ export class PiSession {
 			case "text_delta":
 				if (!event.delta) return;
 				this.#streamedTextThisMessage = true;
-				return this.#notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: event.delta } });
+				return this.#notify({
+					sessionUpdate: "agent_message_chunk",
+					messageId: this.#assistantPartId(event.contentIndex),
+					content: { type: "text", text: event.delta },
+				});
 
 			case "thinking_delta":
 				if (!event.delta) return;
-				return this.#notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: event.delta } });
+				return this.#notify({
+					sessionUpdate: "agent_thought_chunk",
+					messageId: this.#assistantPartId(event.contentIndex),
+					content: { type: "text", text: event.delta },
+				});
 
-			case "toolcall_start": {
+			case "toolcall_start":
 				// Arguments have not streamed in yet; announce the call so the client can
 				// show it immediately, then refine the title once they arrive.
-				const state: ToolCallState = {
-					toolName: event.toolName,
-					title: toolTitle(this.cwd, event.toolName),
-					kind: toolKind(event.toolName),
-					status: "pending",
-					locations: [],
-					announced: true,
-				};
-				this.#toolCalls.set(event.id, state);
-				return this.#notify({
-					sessionUpdate: "tool_call",
-					toolCallId: event.id,
-					title: state.title,
-					kind: state.kind,
-					status: "pending",
-				});
-			}
+				return this.#toolCalls.announce(event.id, event.toolName);
 
-			case "toolcall_end": {
-				const args = event.toolCall.arguments ?? {};
-				return this.#describeToolCall(event.toolCall.id, event.toolCall.name, args, null);
-			}
+			case "toolcall_end":
+				return this.#toolCalls.describe(event.toolCall.id, event.toolCall.name, event.toolCall.arguments ?? {}, null);
 
 			default:
 				return;
@@ -732,166 +699,38 @@ export class PiSession {
 		if (!this.#streamedTextThisMessage) {
 			const text = assistantText(message);
 			if (text) {
-				await this.#notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+				const base = this.#assistantMessageId ?? this.#ids.assistant(message);
+				const index = message.content.findIndex((part) => part.type === "text");
+				await this.#notify({
+					sessionUpdate: "agent_message_chunk",
+					messageId: assistantPart(base, index),
+					content: { type: "text", text },
+				});
 			}
 		}
 		this.#streamedTextThisMessage = false;
+		this.#assistantMessageId = null;
 	}
 
-	/** Fill in everything derivable from a tool call's complete arguments. */
-	async #describeToolCall(
-		toolCallId: string,
-		toolName: string,
-		args: Record<string, unknown>,
-		status: ToolCallStatus | null,
-	): Promise<void> {
-		const state = this.#toolCalls.get(toolCallId) ?? {
-			toolName,
-			title: toolTitle(this.cwd, toolName, args),
-			kind: toolKind(toolName),
-			status: "pending" as ToolCallStatus,
-			locations: [],
-			announced: false,
-		};
-
-		state.args = args;
-		state.title = toolTitle(this.cwd, toolName, args);
-		state.kind = toolKind(toolName);
-		state.locations = toolLocations(this.cwd, toolName, args);
-		if (status) state.status = status;
-		this.#toolCalls.set(toolCallId, state);
-
-		if (!state.announced) {
-			state.announced = true;
-			return this.#notify({
-				sessionUpdate: "tool_call",
-				toolCallId,
-				title: state.title,
-				kind: state.kind,
-				status: state.status,
-				rawInput: args,
-				locations: state.locations,
-			});
-		}
-
-		return this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			title: state.title,
-			kind: state.kind,
-			status: state.status,
-			rawInput: args,
-			locations: state.locations,
-		});
+	/** The message id of one content part of the assistant message pi is streaming. */
+	#assistantPartId(contentIndex: number): string {
+		this.#assistantMessageId ??= this.#ids.assistant({});
+		return assistantPart(this.#assistantMessageId, contentIndex);
 	}
 
-	async #handleToolStart(
-		toolCallId: string,
-		toolName: string,
-		args: Record<string, unknown>,
-		parentToolCallId: string | undefined,
-	): Promise<void> {
-		// A call a tool makes through `ctx.executeTool()` still shows as its own
-		// tool call, but the calling tool stays the one a dialog belongs to:
-		// otherwise the nested call's end would leave no active tool call behind.
-		if (!parentToolCallId) this.#activeToolCallId = toolCallId;
-		await this.#describeToolCall(toolCallId, toolName, args, "in_progress");
-
-		// Snapshot the file before it changes so the completion can carry a real diff.
-		if (isFileMutatingTool(toolName)) {
-			const state = this.#toolCalls.get(toolCallId);
-			const rawPath = typeof args.path === "string" ? args.path : undefined;
-			if (state && rawPath) {
-				state.filePath = resolvePath(this.cwd, rawPath);
-				state.oldText = await this.#files.readText(state.filePath);
-			}
-		}
-	}
-
-	async #handleToolUpdate(toolCallId: string, partialResult: PiToolResult | undefined): Promise<void> {
-		const content = toolResultContent(partialResult);
-		if (content.length === 0) return;
-		return this.#notify({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress", content });
-	}
-
-	async #handleToolEnd(toolCallId: string, result: PiToolResult | undefined, isError: boolean): Promise<void> {
-		if (this.#activeToolCallId === toolCallId) this.#activeToolCallId = null;
-
-		const state = this.#toolCalls.get(toolCallId);
-		if (state) state.status = isError ? "failed" : "completed";
-
-		const content: ToolCallContent[] = [];
-		if (state && !isError && isFileMutatingTool(state.toolName) && state.filePath) {
-			const newText = await this.#files.readText(state.filePath);
-			if (newText !== null) {
-				content.push({ type: "diff", path: state.filePath, oldText: state.oldText ?? null, newText });
-			}
-		}
-		if (content.length === 0) content.push(...toolResultContent(result));
-
-		const details = result?.details;
-		await this.#notify({
-			sessionUpdate: "tool_call_update",
-			toolCallId,
-			status: isError ? "failed" : "completed",
-			content,
-			...(isPlainObject(details) ? { rawOutput: details } : {}),
-		});
-	}
-
-	/**
-	 * Guard against prompts that never start an agent run.
-	 *
-	 * Extension commands (`/mycommand`) are handled inline by pi and may finish
-	 * without emitting `agent_start`/`agent_settled`, which would leave
-	 * `session/prompt` pending forever. pi reports these as a `"handled"`
-	 * disposition, which ends the turn directly; this is the fallback for pi
-	 * builds that report no disposition and for a reported run that never
-	 * materialises. Poll pi until it has been idle for a few consecutive
-	 * checks, then end the turn ourselves.
-	 */
-	#startIdleWatchdog(): void {
-		this.#stopIdleWatchdog();
-		this.#idleObservations = 0;
-		this.#idleWatchdog = setInterval(() => void this.#pollForIdle(), IDLE_POLL_MS);
-		this.#idleWatchdog.unref?.();
-	}
-
-	#stopIdleWatchdog(): void {
-		if (!this.#idleWatchdog) return;
-		clearInterval(this.#idleWatchdog);
-		this.#idleWatchdog = null;
-	}
-
-	async #pollForIdle(): Promise<void> {
-		if (!this.#turn || this.#sawAgentRun) return this.#stopIdleWatchdog();
-
-		let state: PiSessionState;
-		try {
-			state = await this.#client.request({ type: "get_state" });
-		} catch {
-			return;
-		}
-		if (!this.#turn || this.#sawAgentRun) return this.#stopIdleWatchdog();
-
-		if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) {
-			this.#idleObservations = 0;
-			return;
-		}
-		if (++this.#idleObservations < IDLE_OBSERVATIONS_BEFORE_SETTLE) return;
-
-		this.#stopIdleWatchdog();
-		this.#log(
-			`prompt completed without an agent run (pi reported "${this.#promptDisposition ?? "unknown"}"); ending turn`,
-		);
-		this.#enqueue(() => this.#settleTurn());
+	/** Report the prompt's user message as added to the conversation, once. */
+	#markInserted(messageId: string): void {
+		const insertion = this.#insertion;
+		this.#insertion = null;
+		insertion?.(messageId);
 	}
 
 	async #settleTurn(aborted = false): Promise<void> {
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;
+		// pi took the prompt (it answered it) but stored no user message for it.
+		this.#markInserted(this.#ids.unstoredPrompt());
 
 		// pi reports an aborted run on agent_settled; that is authoritative where
 		// the last assistant stop reason is not, for example an abort while a tool
@@ -906,213 +745,35 @@ export class PiSession {
 	}
 
 	#failTurn(error: Error): void {
-		this.#stopIdleWatchdog();
 		const turn = this.#turn;
 		if (!turn) return;
 		this.#turn = null;
+		this.#insertion = null;
 		turn.reject(error);
 	}
 
-	// ==========================================================================
-	// Extension UI bridge
-	// ==========================================================================
-
-	async #handleExtensionUi(request: PiExtensionUiRequest): Promise<void> {
-		switch (request.method) {
-			case "notify":
-				return this.#status(request.message, { level: request.notifyType });
-
-			case "confirm":
-				return this.#askPermission(
-					request.id,
-					request.message ? `${request.title}\n\n${request.message}` : request.title,
-					[
-						{ optionId: "yes", name: "Yes", kind: "allow_once" },
-						{ optionId: "no", name: "No", kind: "reject_once" },
-					],
-					(optionId) => ({ type: "extension_ui_response", id: request.id, confirmed: optionId === "yes" }),
-					{ type: "extension_ui_response", id: request.id, confirmed: false },
-					request.timeout,
-				);
-
-			case "select":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						oneOf: request.options.map((option) => ({ const: option, title: option })),
-					}, request.timeout);
-				}
-				// Without elicitation, a choice is rendered as a permission prompt
-				// whose options are pi's choices.
-				return this.#askPermission(
-					request.id,
-					request.title,
-					request.options.map((option, index) => ({
-						optionId: String(index),
-						name: option,
-						kind: permissionKindFor(option),
-					})),
-					(optionId) => {
-						const value = request.options[Number(optionId)];
-						return value === undefined
-							? { type: "extension_ui_response", id: request.id, cancelled: true }
-							: { type: "extension_ui_response", id: request.id, value };
-					},
-					{ type: "extension_ui_response", id: request.id, cancelled: true },
-					request.timeout,
-				);
-
-			case "input":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						...(request.placeholder ? { description: request.placeholder } : {}),
-					}, request.timeout);
-				}
-				return this.#declineTextInput(request.id, request.title);
-
-			case "editor":
-				if (this.#supportsFormElicitation) {
-					return this.#elicitText(request.id, request.title, {
-						type: "string",
-						...(request.prefill ? { default: request.prefill } : {}),
-					});
-				}
-				return this.#declineTextInput(request.id, request.title);
-
-			default:
-				// setStatus / setWidget / setTitle / set_editor_text are TUI chrome.
-				this.#log(`ignoring extension UI request: ${request.method}`);
-				return;
-		}
-	}
-
-	/** Whether the client renders form elicitations (`elicitation.form`). */
-	get #supportsFormElicitation(): boolean {
-		return this.#clientCapabilities?.elicitation?.form != null;
-	}
-
-	/**
-	 * Ask the user for one value through an ACP form elicitation, and hand it to pi.
-	 *
-	 * The form has a single required field. It is tied to the running tool
-	 * call, if any, like the permission prompts. When pi gives the dialog a
-	 * timeout, the elicitation is withdrawn once pi has stopped waiting.
-	 */
-	async #elicitText(piRequestId: string, message: string, field: ElicitationPropertySchema, timeout?: number): Promise<void> {
-		const toolCallId = this.#activeToolCallId;
-		// Not awaited: pi is blocked on this dialog, and holding the event queue
-		// would stall any tool output still streaming alongside it.
-		void this.#acp
-			.request(
-				methods.client.elicitation.create,
-				{
-					mode: "form",
-					sessionId: this.sessionId,
-					...(toolCallId ? { toolCallId } : {}),
-					message,
-					requestedSchema: { type: "object", properties: { value: field }, required: ["value"] },
-				},
-				withTimeout(timeout),
-			)
-			.then(
-				(response) => {
-					const value = response.action === "accept" && isPlainObject(response.content) ? response.content.value : undefined;
-					this.#client.respondExtensionUi(
-						typeof value === "string"
-							? { type: "extension_ui_response", id: piRequestId, value }
-							: { type: "extension_ui_response", id: piRequestId, cancelled: true },
-					);
-				},
-				(error: unknown) => {
-					this.#log(`elicitation failed: ${errorMessage(error)}`);
-					this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
-				},
-			);
-	}
-
-	/** Without elicitation there is no free-text prompt: cancel, and say why. */
-	async #declineTextInput(piRequestId: string, title: string): Promise<void> {
-		// Decline so the extension takes its cancellation path instead of
-		// blocking pi forever.
-		this.#client.respondExtensionUi({ type: "extension_ui_response", id: piRequestId, cancelled: true });
-		return this.#status(`A pi extension asked for text input ("${title}")`, {
-			level: "warning",
-			description: "This client cannot show text prompts (no form elicitation), so the request was cancelled.",
-		});
-	}
-
-	/**
-	 * Render a pi extension dialog as an ACP permission request.
-	 *
-	 * ACP permission requests hang off a tool call, so when no tool is running
-	 * the dialog gets a synthetic one to anchor it in the client's transcript.
-	 */
-	async #askPermission(
-		requestId: string,
-		title: string,
-		options: PermissionOption[],
-		toResponse: (optionId: string) => Parameters<PiRpcClient["respondExtensionUi"]>[0],
-		onCancel: Parameters<PiRpcClient["respondExtensionUi"]>[0],
-		/** pi's dialog timeout; the prompt is withdrawn once pi stops waiting. */
-		timeout?: number,
-	): Promise<void> {
-		const existing = this.#activeToolCallId;
-		const toolCallId = existing ?? `pi-dialog-${requestId}`;
-		const existingTitle = existing ? this.#toolCalls.get(existing)?.title : undefined;
-		const promptTitle = existingTitle ? `${existingTitle} — ${title}` : title;
-
-		if (!existing) {
-			await this.#notify({
-				sessionUpdate: "tool_call",
-				toolCallId,
-				title,
-				kind: "other",
-				status: "pending",
+	async #settleUnpromptedRun(aborted: boolean): Promise<void> {
+		this.#unpromptedRun = false;
+		const stopReason = this.#lastStopReason;
+		if (!aborted && stopReason === "error") {
+			return this.#port.foreground(this.sessionId, {
+				state: "idle",
+				stopReason: "error",
+				error: { code: -32603, message: this.#lastErrorMessage ?? "pi run failed" },
 			});
 		}
-
-		// Not awaited: pi is blocked on this dialog, and holding the event queue
-		// would stall any tool output still streaming alongside it.
-		void this.#acp
-			.request(
-				methods.client.session.requestPermission,
-				{
-					sessionId: this.sessionId,
-					options,
-					toolCall: { toolCallId, title: promptTitle, ...(existing ? {} : { kind: "other" as const }) },
-				},
-				withTimeout(timeout),
-			)
-			.then(
-				(response) => {
-					const outcome = response.outcome;
-					const answer = outcome.outcome === "selected" ? toResponse(outcome.optionId) : onCancel;
-					this.#client.respondExtensionUi(answer);
-					if (!existing) {
-						this.#enqueue(() =>
-							this.#notify({
-								sessionUpdate: "tool_call_update",
-								toolCallId,
-								status: outcome.outcome === "selected" ? "completed" : "failed",
-							}),
-						);
-					}
-				},
-				(error: unknown) => {
-					this.#log(`permission request failed: ${errorMessage(error)}`);
-					this.#client.respondExtensionUi(onCancel);
-				},
-			);
+		return this.#port.foreground(this.sessionId, {
+			state: "idle",
+			stopReason: aborted ? "cancelled" : ((stopReason && STOP_REASONS[stopReason]) ?? "end_turn"),
+		});
 	}
 
 	// ==========================================================================
 	// Notification helpers
 	// ==========================================================================
 
-	/** Whether the client advertised `session.compaction`, which compaction updates require. */
 	get #tracksCompactions(): boolean {
-		return Boolean(this.#clientCapabilities?.session?.compaction);
+		return this.#port.features.compactionUpdates;
 	}
 
 	#nextCompactionId(): string {
@@ -1146,7 +807,7 @@ export class PiSession {
 	/**
 	 * Out-of-band information for the user: retries, extension messages and the like.
 	 *
-	 * Sent as an ACP `notice` when the client advertises `session.notices`;
+	 * Sent as an ACP `notice` when the client shows notices;
 	 * otherwise as an italic agent message line, which is the fallback the
 	 * protocol suggests. A multi-line title keeps its first line as the title
 	 * and moves the rest into the description.
@@ -1160,7 +821,7 @@ export class PiSession {
 		const heading = first.trim() || detail;
 		if (!heading) return;
 
-		if (this.#clientCapabilities?.session?.notices) {
+		if (this.#port.features.notices) {
 			await this.#notify({
 				sessionUpdate: "notice",
 				severity: level,
@@ -1174,49 +835,14 @@ export class PiSession {
 		const text = detail && heading !== detail ? `${heading}: ${detail}` : heading;
 		await this.#notify({
 			sessionUpdate: "agent_message_chunk",
+			messageId: this.#ids.adapterNote(),
 			content: { type: "text", text: `\n_${prefix}${text.replace(/\n+/g, " ")}_\n` },
 		});
 	}
 
-	async #notify(update: SessionNotification["update"]): Promise<void> {
-		await this.#acp.notify(methods.client.session.update, { sessionId: this.sessionId, update });
+	async #notify(update: SessionUpdate): Promise<void> {
+		await this.#port.update(this.sessionId, update);
 	}
 }
 
 type AssistantMessageDelta = Extract<PiRpcEvent, { type: "message_update" }>["assistantMessageEvent"];
-
-/** pi tool output -> ACP tool call content blocks. */
-function toolResultContent(result: PiToolResult | undefined): ToolCallContent[] {
-	if (!result) return [];
-	const blocks: ContentBlock[] = toAcpContentBlocks(result.content);
-	return blocks.map((content) => ({ type: "content", content }));
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Guess an ACP permission kind from a pi select option's label. */
-function permissionKindFor(option: string): PermissionOption["kind"] {
-	const lower = option.toLowerCase();
-	const rejecting = /\b(no|deny|denied|reject|block|cancel|skip|never|don't|do not)\b/.test(lower);
-	const always = /\b(always|all|session|remember)\b/.test(lower);
-	if (rejecting) return always ? "reject_always" : "reject_once";
-	return always ? "allow_always" : "allow_once";
-}
-
-/**
- * Withdraw a client prompt (`$/cancel_request`) once pi's own dialog timeout
- * has passed: pi has already resolved the dialog by then.
- */
-function withTimeout(timeout: number | undefined): SendRequestOptions | undefined {
-	if (!timeout || timeout <= 0) return undefined;
-	return { cancellationSignal: AbortSignal.timeout(timeout), stopWaitingOnCancel: true };
-}
-
-export function errorMessage(error: unknown): string {
-	if (error instanceof Error) return error.message;
-	return String(error);
-}
-
-

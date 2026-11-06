@@ -132,37 +132,8 @@ describe("session/prompt", () => {
 		const { sessionId } = await newSession();
 		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "/NOOP" }] });
 		expect(response.stopReason).toBe("end_turn");
-		// pi reports the prompt "handled", which ends the turn without waiting
-		// for the idle watchdog.
-		const log = client.stderr.join("");
-		expect(log).toContain('pi reported the prompt "handled"');
-		expect(log).not.toContain("prompt completed without an agent run");
-	});
-
-	describe("with a pi that reports no prompt disposition", () => {
-		let old: TestClient;
-		let oldSession: string;
-		let oldDone: () => void;
-
-		beforeEach(async () => {
-			const created = createTestClient({ env: { MOCK_PI_NO_DISPOSITION: "1" } });
-			({ client: old, cleanup: oldDone } = created);
-			await old.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
-			({ sessionId: oldSession } = await old.newSession({ cwd: created.workspace, mcpServers: [] }));
-		});
-		afterEach(() => oldDone());
-
-		it("still runs prompts", async () => {
-			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "TEXT please" }] });
-			expect(response.stopReason).toBe("end_turn");
-			expect(old.agentText()).toContain("Hello, world!");
-		});
-
-		it("falls back to the idle watchdog for extension commands", async () => {
-			const response = await old.prompt({ sessionId: oldSession, prompt: [{ type: "text", text: "/NOOP" }] });
-			expect(response.stopReason).toBe("end_turn");
-			expect(old.stderr.join("")).toContain('prompt completed without an agent run (pi reported "unknown")');
-		});
+		// pi reports the prompt "handled", which ends the turn at once.
+		expect(client.stderr.join("")).toContain('pi reported the prompt "handled"');
 	});
 });
 
@@ -772,6 +743,27 @@ describe("session/load", () => {
 		expect(
 			replayed.some((u) => u.sessionUpdate === "agent_message_chunk" && u.content.type === "text" && u.content.text.includes("Hello, world!")),
 		).toBe(true);
+	});
+
+	it("gives replayed messages the ids they had live", async () => {
+		const { sessionId } = await newSession();
+		await client.prompt({ sessionId, prompt: [{ type: "text", text: "THINK please" }] });
+		const ids = (updates: typeof client.updates) =>
+			updates.flatMap((u) =>
+				u.sessionUpdate === "agent_message_chunk" || u.sessionUpdate === "agent_thought_chunk"
+					? [`${u.sessionUpdate} ${u.messageId}`]
+					: [],
+			);
+		const live = [...new Set(ids(client.updates))];
+		// One message per content part: the thought, then the text.
+		expect(live).toEqual([expect.stringMatching(/^agent_thought_chunk a-\d+:0$/), expect.stringMatching(/^agent_message_chunk a-\d+:1$/)]);
+
+		const before = client.updates.length;
+		await client.loadSession({ sessionId, cwd: workspace, mcpServers: [] });
+		const replayed = client.updates.slice(before);
+		expect(ids(replayed)).toEqual(live);
+		const user = replayed.find((u) => u.sessionUpdate === "user_message_chunk");
+		expect(user && "messageId" in user ? user.messageId : undefined).toMatch(/^u-\d+$/);
 	});
 
 	it("replays displayable custom messages and skips model-context roles", async () => {

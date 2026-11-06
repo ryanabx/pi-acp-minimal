@@ -6,7 +6,7 @@ import { ConformanceMonitor } from "./conformance/monitor.js";
 import { createTestClient, type TestClient } from "./harness.js";
 
 /**
- * ACP v1 conformance.
+ * ACP conformance, for v1 and for the v2 draft.
  *
  * Every test in the suite already runs under the conformance monitor (see
  * conformance/setup.ts). This file adds two things: proof that the monitor
@@ -153,6 +153,62 @@ describe("the conformance monitor", () => {
 	});
 });
 
+describe("the conformance monitor, for a v2 client", () => {
+	/** A monitor that has seen a v2 initialize and session/new for session "s". */
+	function connectedV2(): ConformanceMonitor {
+		const monitor = new ConformanceMonitor();
+		monitor.fromClient({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 2, info: { name: "c", version: "0" } } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 1, result: { protocolVersion: 2, info: { name: "a", version: "0" } } });
+		monitor.fromClient({ jsonrpc: "2.0", id: 2, method: "session/new", params: { cwd: "/w" } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 2, result: { sessionId: "s" } });
+		return monitor;
+	}
+	const prompt = (id: number) => ({
+		jsonrpc: "2.0",
+		id,
+		method: "session/prompt",
+		params: { sessionId: "s", prompt: [{ type: "text", text: "hi" }] },
+	});
+
+	it("checks frames against the v2 schema", () => {
+		const monitor = connectedV2();
+		monitor.fromClient(prompt(3));
+		monitor.fromAgent(update("s", { sessionUpdate: "user_message", messageId: "u1", content: [{ type: "text", text: "hi" }] }));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: { messageId: "u1" } });
+		monitor.fromAgent(update("s", { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" }));
+		monitor.fromAgent(update("s", { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" }));
+		monitor.finish();
+		expect(monitor.violations).toEqual([]);
+
+		// v1 shapes are not v2: a chunk without its message id, a v1 prompt result.
+		monitor.fromAgent(update("s", text));
+		monitor.fromClient(prompt(4));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 4, result: { stopReason: "end_turn" } });
+		expect(rules(monitor)).toEqual(["schema", "schema"]);
+	});
+
+	it("flags v1-only updates", () => {
+		const monitor = connectedV2();
+		monitor.fromAgent(update("s", { sessionUpdate: "tool_call", toolCallId: "t1", title: "Read" }));
+		expect(rules(monitor)).toContain("version");
+	});
+
+	it("flags an accepted prompt that is never echoed as a user message", () => {
+		const monitor = connectedV2();
+		monitor.fromClient(prompt(3));
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: { messageId: "u1" } });
+		monitor.finish();
+		expect(rules(monitor)).toEqual(["user-message"]);
+	});
+
+	it("flags a session/resume answered without a state update first", () => {
+		const monitor = connectedV2();
+		monitor.fromClient({ jsonrpc: "2.0", id: 3, method: "session/resume", params: { sessionId: "s", cwd: "/w" } });
+		monitor.fromAgent({ jsonrpc: "2.0", id: 3, result: {} });
+		expect(rules(monitor)).toEqual(["state"]);
+	});
+});
+
 /** Every scenario the mock pi can play, by the marker that selects it. */
 const SCENARIOS = [
 	"TEXT",
@@ -220,6 +276,41 @@ async function sweep(client: TestClient, workspace: string, clientCapabilities: 
 	await new Promise((resolve) => setTimeout(resolve, 200));
 }
 
+/** Drive a v2 client through every scenario and session method the v2 front end serves. */
+async function sweepV2(client: TestClient, workspace: string, capabilities: Record<string, unknown>): Promise<void> {
+	client.permissionAnswer = "yes";
+	client.elicitationAnswer = () => ({ action: "accept", content: { value: "red" } });
+	const idles = () => client.updates.filter((u: any) => u.sessionUpdate === "state_update" && u.stopReason).length;
+
+	await client.request("initialize", { protocolVersion: 2, info: { name: "sweep", version: "0" }, capabilities });
+	const { sessionId } = await client.request<{ sessionId: string }>("session/new", { cwd: workspace });
+	for (const scenario of [...SCENARIOS, "AUTORUN"]) {
+		const before = idles();
+		await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: `${scenario} please` }] });
+		await client.waitFor(() => idles() > before);
+	}
+	// The unprompted run AUTORUN starts.
+	await new Promise((resolve) => setTimeout(resolve, 200));
+
+	const before = idles();
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "SLOW please" }] });
+	await client.waitFor((updates) => updates.some((u) => u.sessionUpdate === "agent_message_chunk"));
+	client.cancel(sessionId);
+	await client.waitFor(() => idles() > before);
+
+	await client.request("session/set_config_option", { sessionId, configId: "model", type: "id", value: "openai/gpt-5" });
+	await client.request("session/set_config_option", { sessionId, configId: "nope", type: "id", value: "x" }).catch(() => {});
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }] }).catch(() => {});
+	await client.request("session/list", { cwd: workspace });
+	await client.request("session/resume", { sessionId, cwd: workspace, replayFrom: { type: "start" } });
+	await client.request("session/resume", { sessionId, cwd: workspace });
+	await client.request("session/prompt", { sessionId, prompt: [{ type: "text", text: "SLOW again" }] });
+	await client.request("session/close", { sessionId });
+	await client.request("session/close", { sessionId });
+	await client.request("session/delete", { sessionId: path.join(workspace, "missing.jsonl") }).catch(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 200));
+}
+
 describe("ACP conformance sweep", () => {
 	it.each([
 		["advertises nothing", {}],
@@ -275,6 +366,56 @@ describe("ACP conformance sweep", () => {
 			expect(kinds.has("compaction_update")).toBe(advertised);
 			expect(client.conformance.checked.has("CreateElicitationRequest")).toBe(advertised);
 			expect(client.conformance.checked.has("ReadTextFileRequest")).toBe(advertised);
+		} finally {
+			cleanup();
+		}
+	}, 60_000);
+
+	it.each([
+		["advertises nothing", {}],
+		["advertises elicitation", { elicitation: { form: {} } }],
+	])("stays within the ACP v2 draft for a client that %s", async (_label, capabilities) => {
+		const { client, workspace, cleanup } = createTestClient({
+			extraArgs: (dir) => ["--session-dir", path.join(dir, "store")],
+		});
+		mkdirSync(path.join(workspace, "store"));
+		try {
+			await sweepV2(client, workspace, capabilities);
+
+			const kinds = new Set(client.updates.map((u) => u.sessionUpdate as string));
+			for (const kind of [
+				"user_message",
+				"agent_message_chunk",
+				"agent_thought_chunk",
+				"agent_message",
+				"state_update",
+				"tool_call_update",
+				"terminal_update",
+				"terminal_output_chunk",
+				"available_commands_update",
+				"config_option_update",
+				"usage_update",
+				"session_info_update",
+				"notice",
+				"compaction_update",
+			]) {
+				expect(kinds, kind).toContain(kind);
+			}
+			for (const definition of [
+				"InitializeResponse",
+				"NewSessionResponse",
+				"ResumeSessionResponse",
+				"ListSessionsResponse",
+				"CloseSessionResponse",
+				"PromptResponse",
+				"SetSessionConfigOptionResponse",
+				"UpdateSessionNotification",
+				"RequestPermissionRequest",
+				"Error",
+			]) {
+				expect(client.conformance.checked, definition).toContain(definition);
+			}
+			expect(client.conformance.checked.has("CreateElicitationRequest")).toBe("elicitation" in capabilities);
 		} finally {
 			cleanup();
 		}

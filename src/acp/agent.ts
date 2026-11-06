@@ -1,11 +1,9 @@
 import { readFileSync } from "node:fs";
 import {
 	type AgentApp,
-	type AgentContext,
 	agent as agentApp,
 	type AuthenticateRequest,
 	type CancelNotification,
-	type ClientCapabilities,
 	type CloseSessionRequest,
 	type DeleteSessionRequest,
 	type InitializeRequest,
@@ -32,8 +30,10 @@ import { toPiPrompt } from "../map/content.js";
 import { toPiMcpServers } from "../map/mcp.js";
 import { PiRpcError } from "../pi/rpc-client.js";
 import { PiSessionStore } from "../pi/session-store.js";
-import { authRequired, internalError, invalidParams, resourceNotFound } from "./errors.js";
-import { errorMessage, PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
+import { type ClientPort, V1ClientPort } from "./client-port.js";
+import { ConnectionSlot } from "./connection.js";
+import { authRequired, errorMessage, internalError, invalidParams, resourceNotFound } from "./errors.js";
+import { PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
 export interface PiAcpAgentOptions {
 	/** Executable used to launch pi; when omitted, `pi` is located on `PATH`. */
@@ -45,36 +45,33 @@ export interface PiAcpAgentOptions {
 }
 
 /** This package's own name and version, reported to the client as `agentInfo`. */
-const PACKAGE: { name: string; version: string } = JSON.parse(
+export const PACKAGE: { name: string; version: string } = JSON.parse(
 	readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
 );
 
 /**
- * An ACP agent app that serves pi over one connection, plus a hook to stop
- * every pi process it started.
- *
- * Over stdio there is exactly one connection. A server that accepts several
- * should build one app per connection (for example from a `createAgent`
- * factory): the app owns that connection's sessions. Every method the adapter
- * supports is registered explicitly, so the SDK answers anything else with
- * Method Not Found.
+ * An ACP v1 agent app that serves pi over one connection (see
+ * {@link ConnectionSlot}), plus a hook to stop every pi process it started.
+ * Every method the adapter supports is registered explicitly, so the SDK
+ * answers anything else with Method Not Found.
  */
 export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; shutdown: () => Promise<void> } {
-	let agent: PiAcpAgent | undefined;
-	const connected = (): PiAcpAgent => {
-		if (!agent) throw internalError("ACP connection is not set up");
-		return agent;
-	};
+	const slot = new ConnectionSlot<{ port: V1ClientPort; agent: PiAcpAgent; shutdown(): Promise<void> }>();
+	const connected = () => slot.get().agent;
 
 	const app = agentApp({ name: PACKAGE.name })
-		.onConnect((connection) => {
-			// onConnect runs before the connection handles its first message.
-			if (agent) throw new Error("createPiAgentApp serves a single connection; build one app per connection");
-			const current = new PiAcpAgent(connection.client, options);
-			agent = current;
-			void connection.closed.then(() => current.shutdown());
+		.onConnect((connection) =>
+			slot.open(connection, () => {
+				const port = new V1ClientPort(connection.client);
+				const agent = new PiAcpAgent(port, options);
+				return { port, agent, shutdown: () => agent.shutdown() };
+			}),
+		)
+		.onRequest(methods.agent.initialize, ({ params }) => {
+			const { port, agent } = slot.get();
+			port.features = V1ClientPort.features(params.clientCapabilities);
+			return agent.initialize(params);
 		})
-		.onRequest(methods.agent.initialize, ({ params }) => connected().initialize(params))
 		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))
 		.onRequest(methods.agent.session.new, ({ params }) => connected().newSession(params))
 		.onRequest(methods.agent.session.load, ({ params }) => connected().loadSession(params))
@@ -86,7 +83,7 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onRequest(methods.agent.session.prompt, ({ params }) => connected().prompt(params))
 		.onNotification(methods.agent.session.cancel, ({ params }) => connected().cancel(params));
 
-	return { app, shutdown: async () => agent?.shutdown() };
+	return { app, shutdown: () => slot.shutdown() };
 }
 
 /**
@@ -96,20 +93,18 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
  * is also how per-session working directories, settings and extensions are honoured.
  */
 export class PiAcpAgent {
-	#client: AgentContext;
+	#client: ClientPort;
 	#options: PiAcpAgentOptions;
-	#clientCapabilities: ClientCapabilities | undefined;
 	#sessions = new Map<string, PiSession>();
 	#store: PiSessionStore;
 
-	constructor(client: AgentContext, options: PiAcpAgentOptions) {
+	constructor(client: ClientPort, options: PiAcpAgentOptions) {
 		this.#client = client;
 		this.#options = options;
 		this.#store = new PiSessionStore({ piArgs: options.piArgs, env: options.env ?? process.env });
 	}
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
-		this.#clientCapabilities = params.clientCapabilities;
 		return {
 			protocolVersion: Math.min(params.protocolVersion, PROTOCOL_VERSION),
 			agentInfo: { name: PACKAGE.name, title: "pi", version: PACKAGE.version },
@@ -255,17 +250,26 @@ export class PiAcpAgent {
 		return { configOptions: session.acknowledgeConfigOptions() };
 	}
 
-	async prompt(params: PromptRequest): Promise<PromptResponse> {
+	/** See {@link PiSession.prompt} for `onInserted`. */
+	async prompt(
+		params: PromptRequest,
+		hooks: { onInserted?: (messageId: string) => void } = {},
+	): Promise<PromptResponse> {
 		const session = this.#session(params.sessionId);
 		const { message, images } = toPiPrompt(params.prompt);
 		if (!message && images.length === 0) throw invalidParams("Prompt is empty");
 
-		const stopReason = await session.prompt(message, images);
+		const stopReason = await session.prompt(message, images, hooks);
 		return { stopReason };
 	}
 
 	async cancel(params: CancelNotification): Promise<void> {
 		await this.#sessions.get(params.sessionId)?.cancel();
+	}
+
+	/** Whether a session is open on this connection. */
+	hasSession(sessionId: string): boolean {
+		return this.#sessions.has(sessionId);
 	}
 
 	/** Shut every pi child process down; used when the ACP connection closes. */
@@ -281,7 +285,6 @@ export class PiAcpAgent {
 	): Promise<PiSession> {
 		const session = new PiSession({
 			client: this.#client,
-			clientCapabilities: this.#clientCapabilities,
 			cwd,
 			piCommand: this.#options.piCommand,
 			piArgs: this.#options.piArgs,

@@ -192,6 +192,8 @@ export type PiMessage =
 export interface PiToolResult {
 	content: PiContent[];
 	details?: unknown;
+	/** Machine-readable result matching the tool's output schema; bash reports `exit_code` here. */
+	structuredContent?: unknown;
 }
 
 // ============================================================================

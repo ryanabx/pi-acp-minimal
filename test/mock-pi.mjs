@@ -120,20 +120,30 @@ const scenarios = [
 	{ match: /\bUNNAME\b/, run: unnameScenario },
 	{ match: /\bMODELCHANGE\b/, run: modelChangeScenario },
 	{ match: /\bNOSTATS\b/, run: noStatsScenario },
+	{ match: /\bAUTORUN\b/, run: textScenario },
 ];
 
+/** pi stamps an assistant message once, when it starts streaming; the stored copy keeps that time. */
+let assistantTimestamp = 0;
+
 function startAssistant() {
+	assistantTimestamp = uniqueTimestamp();
 	write({ type: "turn_start" });
 	write({
 		type: "message_start",
-		message: { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4", usage, timestamp: Date.now() },
+		message: { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4", usage, timestamp: assistantTimestamp },
 	});
+}
+
+/** Date.now(), but never twice the same: scenarios run faster than a millisecond. */
+let lastTimestamp = 0;
+function uniqueTimestamp() {
+	lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+	return lastTimestamp;
 }
 
 /** pi 1.x reports a per-input disposition on the prompt response. */
 function promptDisposition(message) {
-	// MOCK_PI_NO_DISPOSITION mimics an older pi that sends no response data.
-	if (process.env.MOCK_PI_NO_DISPOSITION === "1") return undefined;
 	// The NOOP scenario is an extension command that consumes the prompt inline.
 	return { disposition: /\bNOOP\b/.test(message) ? "handled" : "started" };
 }
@@ -146,7 +156,7 @@ function endAssistant(content, stopReason, errorMessage) {
 		model: "claude-sonnet-4",
 		usage,
 		stopReason,
-		timestamp: Date.now(),
+		timestamp: assistantTimestamp,
 	};
 	if (errorMessage) message.errorMessage = errorMessage;
 	messages.push(message);
@@ -188,7 +198,9 @@ async function editScenario() {
 	delta({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-edit", name: "write", arguments: args } });
 
 	write({ type: "tool_execution_start", toolCallId: "call-edit", toolName: "write", args });
-	await sleep(10);
+	// The adapter snapshots the file on tool_execution_start; leave it time to,
+	// even on a loaded machine running the suite in parallel.
+	await sleep(100);
 	writeFileSync(target, "after\n");
 	write({
 		type: "tool_execution_end",
@@ -217,7 +229,7 @@ async function bashScenario() {
 		type: "tool_execution_end",
 		toolCallId: "call-bash",
 		toolName: "bash",
-		result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 } },
+		result: { content: [{ type: "text", text: "hi\n" }], details: { exitCode: 0 }, structuredContent: { exit_code: 3 } },
 		isError: false,
 		durationMs: 42,
 	});
@@ -426,7 +438,7 @@ function waitForUiResponse(id) {
 
 async function runPrompt(message) {
 	aborted = false;
-	messages.push({ role: "user", content: [{ type: "text", text: message }], timestamp: Date.now() });
+	messages.push({ role: "user", content: [{ type: "text", text: message }], timestamp: uniqueTimestamp() });
 	if (!/\bNOOP\b/.test(message)) write({ type: "agent_start" });
 	write({ type: "message_start", message: messages.at(-1) });
 	write({ type: "message_end", message: messages.at(-1) });
@@ -444,6 +456,22 @@ async function runPrompt(message) {
 	state.isStreaming = false;
 	persist();
 	write({ type: "agent_settled", aborted });
+
+	// A queued follow-up or an extension starts a run nobody prompted for.
+	if (/\bAUTORUN\b/.test(message)) setTimeout(() => void unpromptedRun(), 50);
+}
+
+async function unpromptedRun() {
+	state.isStreaming = true;
+	write({ type: "agent_start" });
+	startAssistant();
+	delta({ type: "text_start", contentIndex: 0 });
+	delta({ type: "text_delta", contentIndex: 0, delta: "on my own" });
+	endAssistant([{ type: "text", text: "on my own" }], "stop");
+	write({ type: "agent_end", messages: [], willRetry: false });
+	state.isStreaming = false;
+	persist();
+	write({ type: "agent_settled", aborted: false });
 }
 
 function success(id, command, data) {

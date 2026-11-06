@@ -12,14 +12,15 @@ const CODES = {
 	internalError: -32603,
 	authRequired: -32000,
 	resourceNotFound: -32002,
+	requestCancelled: -32800,
 } as const;
 
 export function invalidRequest(message: string): RequestError {
 	return new RequestError(CODES.invalidRequest, message);
 }
 
-export function invalidParams(message: string): RequestError {
-	return new RequestError(CODES.invalidParams, message);
+export function invalidParams(message: string, data?: unknown): RequestError {
+	return new RequestError(CODES.invalidParams, message, data);
 }
 
 export function internalError(message: string, data?: unknown): RequestError {
@@ -30,6 +31,15 @@ export function authRequired(message: string): RequestError {
 	return new RequestError(CODES.authRequired, message);
 }
 
-export function resourceNotFound(message: string): RequestError {
-	return new RequestError(CODES.resourceNotFound, message);
+export function resourceNotFound(message: string, data?: unknown): RequestError {
+	return new RequestError(CODES.resourceNotFound, message, data);
+}
+
+export function requestCancelled(message: string): RequestError {
+	return new RequestError(CODES.requestCancelled, message);
+}
+
+export function errorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	return String(error);
 }
