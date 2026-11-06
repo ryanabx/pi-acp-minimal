@@ -2,7 +2,6 @@ import type * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { internalError, invalidParams, requestCancelled, resourceNotFound } from "../errors.js";
 import { PACKAGE, PiAcpAgent, type PiAcpAgentOptions } from "../agent.js";
-import { errorMessage } from "../session.js";
 import { V2ClientPort } from "./client-port.js";
 import { toV1McpServers, toV2ConfigOptions, unsupportedPromptContent } from "./translate.js";
 
@@ -21,8 +20,8 @@ const SESSION_CAPABILITIES = {
  * v2 runs on the same core as v1: a {@link V2ClientPort} turns the core's v1
  * messages into v2, and the handlers here turn v2 requests into the core's v1
  * calls. What v2 adds on top lives here and in the port: prompts answered as
- * soon as pi takes them, the session's foreground state, and resuming with a
- * replay instead of `session/load`.
+ * soon as pi takes them, the session's foreground state (reported by the
+ * core), and resuming with a replay instead of `session/load`.
  *
  * The draft is experimental and may change incompatibly; the version this
  * implements is the one in the pinned `@agentclientprotocol/sdk`.
@@ -58,8 +57,6 @@ export function createPiAgentAppV2(options: PiAcpAgentOptions): { app: v2.AgentA
 class V2FrontEnd {
 	#port: V2ClientPort;
 	#agent: PiAcpAgent;
-	/** Per session, the running prompt turn: settles once its final state update is out. */
-	#turns = new Map<string, Promise<void>>();
 
 	constructor(client: v2.AgentContext, options: PiAcpAgentOptions) {
 		this.#port = new V2ClientPort(client);
@@ -136,8 +133,10 @@ class V2FrontEnd {
 	}
 
 	/**
-	 * Answers with the user message's id as soon as pi has taken the prompt;
-	 * the turn then runs on, and its end is reported as an idle state update.
+	 * Answers with the user message's id as soon as pi has taken the prompt.
+	 * The turn runs on; the core reports it as state updates, including a
+	 * failure, which once the prompt is in ends the turn instead of failing
+	 * the request.
 	 */
 	async prompt(params: v2.PromptRequest): Promise<v2.PromptResponse> {
 		const { sessionId } = params;
@@ -149,40 +148,20 @@ class V2FrontEnd {
 
 		return new Promise<v2.PromptResponse>((resolve, reject) => {
 			let inserted = false;
-			const turn = this.#agent
-				.prompt(
-					{ sessionId, prompt: params.prompt as v1.ContentBlock[] },
-					{
-						onInserted: (messageId) => {
-							inserted = true;
-							// Both go out before anything the turn sends next.
-							void this.#port.userMessage(sessionId, messageId, params.prompt);
-							void this.#port.foreground(sessionId, { state: "running" });
-							resolve({ messageId });
-						},
-					},
-				)
-				.then(
-					async ({ stopReason }) => {
-						if (!inserted) return reject(requestCancelled("The prompt was cancelled before pi took it"));
-						await this.#port.foreground(sessionId, { state: "idle", stopReason });
-					},
-					async (error: unknown) => {
-						// Once the prompt is in the conversation, a failure ends the turn
-						// instead of failing the request.
-						if (!inserted) return reject(error);
-						const code = typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : -32603;
-						await this.#port.foreground(sessionId, {
-							state: "idle",
-							stopReason: "error",
-							error: { code, message: errorMessage(error) },
-						});
-					},
-				);
-			this.#turns.set(sessionId, turn);
-			void turn.finally(() => {
-				if (this.#turns.get(sessionId) === turn) this.#turns.delete(sessionId);
-			});
+			const onInserted = (messageId: string) => {
+				inserted = true;
+				// Sent at once, ahead of whatever the turn sends next.
+				void this.#port.userMessage(sessionId, messageId, params.prompt);
+				resolve({ messageId });
+			};
+			this.#agent.prompt({ sessionId, prompt: params.prompt as v1.ContentBlock[] }, { onInserted }).then(
+				() => {
+					if (!inserted) reject(requestCancelled("The prompt was cancelled before pi took it"));
+				},
+				(error: unknown) => {
+					if (!inserted) reject(error);
+				},
+			);
 		});
 	}
 
@@ -203,8 +182,8 @@ class V2FrontEnd {
 	async #endLiveSession(sessionId: string): Promise<void> {
 		if (!this.#agent.hasSession(sessionId)) return;
 		this.#port.withdrawRequests(sessionId);
+		// Resolves once a running turn has sent its last updates.
 		await this.#agent.closeSession({ sessionId });
-		await this.#turns.get(sessionId)?.catch(() => undefined);
 		this.#port.close(sessionId);
 	}
 

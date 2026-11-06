@@ -143,10 +143,6 @@ export class V2ClientPort implements ClientPort {
 		}
 	}
 
-	unpromptedRun(sessionId: string, state: ForegroundState): Promise<void> {
-		return this.foreground(sessionId, state);
-	}
-
 	async requestPermission(prompt: PermissionPrompt, options?: v1.SendRequestOptions): Promise<PermissionOutcome> {
 		const offered = new Set(prompt.options.map((option) => option.optionId));
 		const response = await this.#whileBlocking(prompt.sessionId, options, (requestOptions) =>

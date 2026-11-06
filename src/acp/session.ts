@@ -121,6 +121,8 @@ export class PiSession {
 	#activeToolCallId: string | null = null;
 
 	#turn: { resolve: (reason: PromptStopReason) => void; reject: (error: Error) => void } | null = null;
+	/** Settles once the latest prompt turn has sent its last update. */
+	#turnDone: Promise<void> = Promise.resolve();
 	#cancelled = false;
 	#sawAgentRun = false;
 	/** What pi reported it did with the current prompt, if anything yet. */
@@ -212,6 +214,7 @@ export class PiSession {
 	 *
 	 * Once pi is gone no `agent_settled` can arrive, so a turn still waiting on
 	 * one ends here as cancelled rather than hanging its `session/prompt`.
+	 * Resolves once that turn has sent its last update.
 	 */
 	async close(): Promise<void> {
 		await this.cancel();
@@ -221,6 +224,7 @@ export class PiSession {
 		this.#turn = null;
 		this.#insertion = null;
 		turn?.resolve("cancelled");
+		await this.#turnDone;
 	}
 
 	/**
@@ -429,7 +433,24 @@ export class PiSession {
 		{ onInserted }: { onInserted?: (messageId: string) => void } = {},
 	): Promise<PromptStopReason> {
 		if (this.#turn) throw invalidRequest("A prompt turn is already in progress for this session");
+		const turn = this.#runTurn(message, images, onInserted);
+		this.#turnDone = turn.then(
+			() => undefined,
+			() => undefined,
+		);
+		return turn;
+	}
 
+	/**
+	 * One prompt turn. Once pi has taken the prompt the turn is foreground work:
+	 * reported `running` then, and `idle` with its stop reason after the last
+	 * update it causes.
+	 */
+	async #runTurn(
+		message: string,
+		images: PiImageContent[],
+		onInserted: ((messageId: string) => void) | undefined,
+	): Promise<PromptStopReason> {
 		this.#cancelled = false;
 		this.#sawAgentRun = false;
 		this.#promptDisposition = undefined;
@@ -441,7 +462,13 @@ export class PiSession {
 		const settled = new Promise<PromptStopReason>((resolve, reject) => {
 			this.#turn = { resolve, reject };
 		});
-		this.#insertion = onInserted ?? null;
+		let inserted = false;
+		this.#insertion = (messageId) => {
+			inserted = true;
+			onInserted?.(messageId);
+			// Not awaited: sent at once, ahead of whatever the turn sends next.
+			void this.#port.foreground(this.sessionId, { state: "running" });
+		};
 
 		try {
 			const response = await this.#client.request({
@@ -473,10 +500,24 @@ export class PiSession {
 			// builds that do not report a disposition.
 			this.#startIdleWatchdog();
 		}
-		const stopReason = await settled;
+		let stopReason: PromptStopReason;
+		try {
+			stopReason = await settled;
+		} catch (error) {
+			if (inserted) {
+				const code = typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : -32603;
+				await this.#port.foreground(this.sessionId, {
+					state: "idle",
+					stopReason: "error",
+					error: { code, message: errorMessage(error) },
+				});
+			}
+			throw error;
+		}
 		await this.publishCommands();
 		await this.publishConfigOptions();
 		await this.publishUsage();
+		if (inserted) await this.#port.foreground(this.sessionId, { state: "idle", stopReason });
 		return stopReason;
 	}
 
@@ -637,7 +678,7 @@ export class PiSession {
 					this.#unpromptedRun = true;
 					this.#lastStopReason = undefined;
 					this.#lastErrorMessage = undefined;
-					return this.#port.unpromptedRun(this.sessionId, { state: "running" });
+					return this.#port.foreground(this.sessionId, { state: "running" });
 				}
 				// A real agent run is under way; the turn now ends on `agent_settled`.
 				this.#sawAgentRun = true;
@@ -1079,13 +1120,13 @@ export class PiSession {
 		this.#unpromptedRun = false;
 		const stopReason = this.#lastStopReason;
 		if (!aborted && stopReason === "error") {
-			return this.#port.unpromptedRun(this.sessionId, {
+			return this.#port.foreground(this.sessionId, {
 				state: "idle",
 				stopReason: "error",
 				error: { code: -32603, message: this.#lastErrorMessage ?? "pi run failed" },
 			});
 		}
-		return this.#port.unpromptedRun(this.sessionId, {
+		return this.#port.foreground(this.sessionId, {
 			state: "idle",
 			stopReason: aborted ? "cancelled" : ((stopReason && STOP_REASONS[stopReason]) ?? "end_turn"),
 		});

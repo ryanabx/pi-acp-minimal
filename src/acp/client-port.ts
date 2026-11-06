@@ -88,11 +88,10 @@ export interface ClientPort {
 	/** A file as the client sees it; only called when `features.readTextFile` is set. */
 	readTextFile(sessionId: string, path: string): Promise<string>;
 	/**
-	 * pi started or finished a run nobody prompted for: a queued follow-up, or
-	 * an extension that started one. Prompted turns are reported by whoever
-	 * sent the prompt.
+	 * pi's foreground work started or ended: a prompt turn (once pi has taken
+	 * the prompt), or a run nobody prompted for, such as a queued follow-up.
 	 */
-	unpromptedRun(sessionId: string, state: ForegroundState): Promise<void>;
+	foreground(sessionId: string, state: ForegroundState): Promise<void>;
 }
 
 /** ACP v1: the core's messages go to the client unchanged. */
@@ -176,7 +175,8 @@ export class V1ClientPort implements ClientPort {
 		return response.content;
 	}
 
-	async unpromptedRun(): Promise<void> {
-		// v1 has no way to report work nobody prompted for; its updates stand alone.
+	async foreground(): Promise<void> {
+		// v1 reports a turn's end by answering session/prompt, and has no way to
+		// report work nobody prompted for.
 	}
 }
