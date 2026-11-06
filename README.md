@@ -146,6 +146,7 @@ src/
       app.ts          ACP v2 agent app: v2 requests -> core calls, prompt lifecycle, resume/close
       client-port.ts  V2ClientPort: core (v1) messages -> v2, foreground state, withdrawn requests
       translate.ts    pure v1 <-> v2 conversions (config options, commands, MCP servers, diffs)
+    connection.ts     the one object that serves an agent app's connection
     file-access.ts    reads files via the client's fs when available, else local disk
     errors.ts         JSON-RPC errors that carry a readable message
     wire-trace.ts     --log-file: every ACP frame to a JSONL file

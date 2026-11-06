@@ -1,6 +1,7 @@
 import type * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
-import { internalError, invalidParams, requestCancelled, resourceNotFound } from "../errors.js";
+import { ConnectionSlot } from "../connection.js";
+import { invalidParams, requestCancelled, resourceNotFound } from "../errors.js";
 import { PACKAGE, PiAcpAgent, type PiAcpAgentOptions } from "../agent.js";
 import { V2ClientPort } from "./client-port.js";
 import { toV1McpServers, toV2ConfigOptions, unsupportedPromptContent } from "./translate.js";
@@ -27,20 +28,12 @@ const SESSION_CAPABILITIES = {
  * implements is the one in the pinned `@agentclientprotocol/sdk`.
  */
 export function createPiAgentAppV2(options: PiAcpAgentOptions): { app: v2.AgentApp; shutdown: () => Promise<void> } {
-	let frontEnd: V2FrontEnd | undefined;
-	const connected = (): V2FrontEnd => {
-		if (!frontEnd) throw internalError("ACP connection is not set up");
-		return frontEnd;
-	};
+	const slot = new ConnectionSlot<V2FrontEnd>();
+	const connected = () => slot.get();
 
 	const app = v2
 		.agent({ name: PACKAGE.name })
-		.onConnect((connection) => {
-			if (frontEnd) throw new Error("createPiAgentAppV2 serves a single connection; build one app per connection");
-			const current = new V2FrontEnd(connection.client, options);
-			frontEnd = current;
-			void connection.closed.then(() => current.shutdown());
-		})
+		.onConnect((connection) => slot.open(connection, () => new V2FrontEnd(connection.client, options)))
 		.onRequest(v2.methods.agent.initialize, ({ params }) => connected().initialize(params))
 		.onRequest(v2.methods.agent.session.new, ({ params }) => connected().newSession(params))
 		.onRequest(v2.methods.agent.session.resume, ({ params }) => connected().resumeSession(params))
@@ -51,7 +44,7 @@ export function createPiAgentAppV2(options: PiAcpAgentOptions): { app: v2.AgentA
 		.onRequest(v2.methods.agent.session.prompt, ({ params }) => connected().prompt(params))
 		.onNotification(v2.methods.agent.session.cancel, ({ params }) => connected().cancel(params));
 
-	return { app, shutdown: async () => frontEnd?.shutdown() };
+	return { app, shutdown: () => slot.shutdown() };
 }
 
 class V2FrontEnd {

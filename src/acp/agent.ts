@@ -31,6 +31,7 @@ import { toPiMcpServers } from "../map/mcp.js";
 import { PiRpcError } from "../pi/rpc-client.js";
 import { PiSessionStore } from "../pi/session-store.js";
 import { type ClientPort, V1ClientPort } from "./client-port.js";
+import { ConnectionSlot } from "./connection.js";
 import { authRequired, errorMessage, internalError, invalidParams, resourceNotFound } from "./errors.js";
 import { PiSession, UNPERSISTED_SESSION_PREFIX } from "./session.js";
 
@@ -49,35 +50,27 @@ export const PACKAGE: { name: string; version: string } = JSON.parse(
 );
 
 /**
- * An ACP agent app that serves pi over one connection, plus a hook to stop
- * every pi process it started.
- *
- * Over stdio there is exactly one connection. A server that accepts several
- * should build one app per connection (for example from a `createAgent`
- * factory): the app owns that connection's sessions. Every method the adapter
- * supports is registered explicitly, so the SDK answers anything else with
- * Method Not Found.
+ * An ACP v1 agent app that serves pi over one connection (see
+ * {@link ConnectionSlot}), plus a hook to stop every pi process it started.
+ * Every method the adapter supports is registered explicitly, so the SDK
+ * answers anything else with Method Not Found.
  */
 export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; shutdown: () => Promise<void> } {
-	let agent: PiAcpAgent | undefined;
-	let port: V1ClientPort | undefined;
-	const connected = (): PiAcpAgent => {
-		if (!agent) throw internalError("ACP connection is not set up");
-		return agent;
-	};
+	const slot = new ConnectionSlot<{ port: V1ClientPort; agent: PiAcpAgent; shutdown(): Promise<void> }>();
+	const connected = () => slot.get().agent;
 
 	const app = agentApp({ name: PACKAGE.name })
-		.onConnect((connection) => {
-			// onConnect runs before the connection handles its first message.
-			if (agent) throw new Error("createPiAgentApp serves a single connection; build one app per connection");
-			port = new V1ClientPort(connection.client);
-			const current = new PiAcpAgent(port, options);
-			agent = current;
-			void connection.closed.then(() => current.shutdown());
-		})
+		.onConnect((connection) =>
+			slot.open(connection, () => {
+				const port = new V1ClientPort(connection.client);
+				const agent = new PiAcpAgent(port, options);
+				return { port, agent, shutdown: () => agent.shutdown() };
+			}),
+		)
 		.onRequest(methods.agent.initialize, ({ params }) => {
-			if (port) port.features = V1ClientPort.features(params.clientCapabilities);
-			return connected().initialize(params);
+			const { port, agent } = slot.get();
+			port.features = V1ClientPort.features(params.clientCapabilities);
+			return agent.initialize(params);
 		})
 		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))
 		.onRequest(methods.agent.session.new, ({ params }) => connected().newSession(params))
@@ -90,7 +83,7 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onRequest(methods.agent.session.prompt, ({ params }) => connected().prompt(params))
 		.onNotification(methods.agent.session.cancel, ({ params }) => connected().cancel(params));
 
-	return { app, shutdown: async () => agent?.shutdown() };
+	return { app, shutdown: () => slot.shutdown() };
 }
 
 /**
