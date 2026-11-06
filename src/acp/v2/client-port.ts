@@ -1,6 +1,7 @@
 import type * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type {
+	ClientFeatures,
 	ClientPort,
 	ForegroundState,
 	PermissionOutcome,
@@ -33,23 +34,24 @@ interface SessionState {
  * the silence after `session/close`.
  */
 export class V2ClientPort implements ClientPort {
-	/**
-	 * The core's view of a v2 client, in v1 terms. v2 has no client file system
-	 * or terminals, and needs no capability for notices or compaction updates,
-	 * so the core takes its richest path for those.
-	 */
-	capabilities: v1.ClientCapabilities = V2ClientPort.coreCapabilities(undefined);
+	features: ClientFeatures = V2ClientPort.features(undefined);
 
 	#sessions = new Map<string, SessionState>();
 
 	constructor(private readonly client: v2.AgentContext) {}
 
-	static coreCapabilities(capabilities: v2.ClientCapabilities | null | undefined): v1.ClientCapabilities {
+	/**
+	 * What a v2 client supports. v2 has no client file system; notices,
+	 * compaction updates and display terminals need no capability, so every v2
+	 * client gets them; form elicitation is the one thing a client advertises.
+	 */
+	static features(capabilities: v2.ClientCapabilities | null | undefined): ClientFeatures {
 		return {
-			fs: { readTextFile: false, writeTextFile: false },
-			terminal: false,
-			session: { notices: {}, compaction: {} },
-			...(capabilities?.elicitation ? { elicitation: capabilities.elicitation as v1.ElicitationCapabilities } : {}),
+			readTextFile: false,
+			formElicitation: capabilities?.elicitation?.form != null,
+			notices: true,
+			compactionUpdates: true,
+			displayTerminals: true,
 		};
 	}
 
@@ -114,9 +116,6 @@ export class V2ClientPort implements ClientPort {
 	update(sessionId: string, update: SessionUpdate): Promise<void> {
 		return this.#send(sessionId, this.#translate(sessionId, update));
 	}
-
-	/** v2 terminals are first-class: any v2 client displays the ones the agent runs. */
-	readonly displaysTerminals = true;
 
 	terminal(sessionId: string, event: TerminalEvent): Promise<void> {
 		switch (event.type) {

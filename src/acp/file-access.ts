@@ -17,7 +17,7 @@ export class FileAccess {
 
 	/** File contents, or `null` when the file does not exist or cannot be read. */
 	async readText(absolutePath: string): Promise<string | null> {
-		if (this.client.capabilities?.fs?.readTextFile) {
+		if (this.client.features.readTextFile) {
 			try {
 				return await this.client.readTextFile(this.sessionId(), absolutePath);
 			} catch {

@@ -70,13 +70,13 @@ export function createPiAgentApp(options: PiAcpAgentOptions): { app: AgentApp; s
 		.onConnect((connection) => {
 			// onConnect runs before the connection handles its first message.
 			if (agent) throw new Error("createPiAgentApp serves a single connection; build one app per connection");
-			port = new V1ClientPort(connection.client, undefined);
+			port = new V1ClientPort(connection.client);
 			const current = new PiAcpAgent(port, options);
 			agent = current;
 			void connection.closed.then(() => current.shutdown());
 		})
 		.onRequest(methods.agent.initialize, ({ params }) => {
-			if (port) port.capabilities = params.clientCapabilities;
+			if (port) port.features = V1ClientPort.features(params.clientCapabilities);
 			return connected().initialize(params);
 		})
 		.onRequest(methods.agent.authenticate, ({ params }) => connected().authenticate(params))

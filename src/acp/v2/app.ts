@@ -67,7 +67,7 @@ class V2FrontEnd {
 	}
 
 	async initialize(params: v2.InitializeRequest): Promise<v2.InitializeResponse> {
-		this.#port.capabilities = V2ClientPort.coreCapabilities(params.capabilities);
+		this.#port.features = V2ClientPort.features(params.capabilities);
 		// No auth methods: pi manages provider credentials itself (`pi auth
 		// login`), so neither `auth/login` nor `auth/logout` is offered.
 		return {

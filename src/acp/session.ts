@@ -1,6 +1,5 @@
 import {
 	type AvailableCommand,
-	type ClientCapabilities,
 	type ContentBlock,
 	type ElicitationPropertySchema,
 	type SendRequestOptions,
@@ -948,7 +947,7 @@ export class PiSession {
 	// tool call refers to it instead of carrying the output as text.
 
 	get #showsTerminals(): boolean {
-		return this.#port.displaysTerminals;
+		return this.#port.features.displayTerminals;
 	}
 
 	async #openTerminal(toolCallId: string, state: ToolCallState): Promise<void> {
@@ -1168,9 +1167,8 @@ export class PiSession {
 		}
 	}
 
-	/** Whether the client renders form elicitations (`elicitation.form`). */
 	get #supportsFormElicitation(): boolean {
-		return this.#clientCapabilities?.elicitation?.form != null;
+		return this.#port.features.formElicitation;
 	}
 
 	/**
@@ -1259,13 +1257,8 @@ export class PiSession {
 	// Notification helpers
 	// ==========================================================================
 
-	get #clientCapabilities(): ClientCapabilities | undefined {
-		return this.#port.capabilities;
-	}
-
-	/** Whether the client advertised `session.compaction`, which compaction updates require. */
 	get #tracksCompactions(): boolean {
-		return Boolean(this.#clientCapabilities?.session?.compaction);
+		return this.#port.features.compactionUpdates;
 	}
 
 	#nextCompactionId(): string {
@@ -1299,7 +1292,7 @@ export class PiSession {
 	/**
 	 * Out-of-band information for the user: retries, extension messages and the like.
 	 *
-	 * Sent as an ACP `notice` when the client advertises `session.notices`;
+	 * Sent as an ACP `notice` when the client shows notices;
 	 * otherwise as an italic agent message line, which is the fallback the
 	 * protocol suggests. A multi-line title keeps its first line as the title
 	 * and moves the rest into the description.
@@ -1313,7 +1306,7 @@ export class PiSession {
 		const heading = first.trim() || detail;
 		if (!heading) return;
 
-		if (this.#clientCapabilities?.session?.notices) {
+		if (this.#port.features.notices) {
 			await this.#notify({
 				sessionUpdate: "notice",
 				severity: level,

@@ -40,6 +40,27 @@ export type TerminalEvent =
 	| { type: "output"; terminalId: string; data: string }
 	| { type: "exit"; terminalId: string; exitCode: number | null };
 
+/**
+ * The client features the core adapts to. Each port derives them from what
+ * its protocol version lets a client advertise.
+ */
+export interface ClientFeatures {
+	/** The client serves `fs/read_text_file`, so diffs can snapshot unsaved buffers. */
+	readTextFile: boolean;
+	/** The client renders form elicitations, so extension dialogs can ask for text. */
+	formElicitation: boolean;
+	/** The client shows `notice` updates; otherwise status lines go into the transcript. */
+	notices: boolean;
+	/** The client tracks `compaction_update`s; otherwise compactions are reported as status lines. */
+	compactionUpdates: boolean;
+	/**
+	 * Shell output goes to a display terminal (see {@link ClientPort.terminal}),
+	 * which the tool call refers to with `{ type: "terminal" }` content, instead
+	 * of being text content on the tool call.
+	 */
+	displayTerminals: boolean;
+}
+
 /** Foreground work as ACP v2 state updates report it. */
 export type ForegroundState =
 	| { state: "running" }
@@ -54,14 +75,8 @@ export type ForegroundState =
  * through, and the v2 port (`./v2/client-port.ts`) translates them.
  */
 export interface ClientPort {
-	/** What the client supports, in v1 terms. */
-	readonly capabilities: ClientCapabilities | undefined;
-	/**
-	 * Whether shell output goes to a display terminal ({@link terminal}). The
-	 * tool call then refers to it with `{ type: "terminal" }` content instead
-	 * of carrying the output as text.
-	 */
-	readonly displaysTerminals: boolean;
+	readonly features: ClientFeatures;
+	/** Only called when `features.displayTerminals` is set. */
 	terminal(sessionId: string, event: TerminalEvent): Promise<void>;
 	update(sessionId: string, update: SessionUpdate): Promise<void>;
 	/**
@@ -70,7 +85,7 @@ export interface ClientPort {
 	 */
 	requestPermission(prompt: PermissionPrompt, options?: SendRequestOptions): Promise<PermissionOutcome>;
 	elicit(request: CreateElicitationRequest, options?: SendRequestOptions): Promise<CreateElicitationResponse>;
-	/** A file as the client sees it; only called when `capabilities.fs.readTextFile` is set. */
+	/** A file as the client sees it; only called when `features.readTextFile` is set. */
 	readTextFile(sessionId: string, path: string): Promise<string>;
 	/**
 	 * pi started or finished a run nobody prompted for: a queued follow-up, or
@@ -82,17 +97,24 @@ export interface ClientPort {
 
 /** ACP v1: the core's messages go to the client unchanged. */
 export class V1ClientPort implements ClientPort {
-	constructor(
-		private readonly client: AgentContext,
-		/** Set once the client has sent `initialize`. */
-		public capabilities: ClientCapabilities | undefined,
-	) {}
+	features: ClientFeatures = V1ClientPort.features(undefined);
 
-	/** v1 terminals are ones the client runs; shell output stays text content. */
-	readonly displaysTerminals = false;
+	constructor(private readonly client: AgentContext) {}
+
+	/** What a v1 client supports, from the capabilities its `initialize` advertised. */
+	static features(capabilities: ClientCapabilities | undefined): ClientFeatures {
+		return {
+			readTextFile: capabilities?.fs?.readTextFile === true,
+			formElicitation: capabilities?.elicitation?.form != null,
+			notices: capabilities?.session?.notices != null,
+			compactionUpdates: capabilities?.session?.compaction != null,
+			// v1 terminals are ones the client runs; shell output stays text content.
+			displayTerminals: false,
+		};
+	}
 
 	async terminal(): Promise<void> {
-		// Never called: displaysTerminals is false.
+		// Never called: v1 has no display terminals.
 	}
 
 	async update(sessionId: string, update: SessionUpdate): Promise<void> {
