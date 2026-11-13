@@ -101,6 +101,7 @@ const scenarios = [
 	{ match: /\bEDIT\b/, run: editScenario },
 	{ match: /\bBASH\b/, run: bashScenario },
 	{ match: /\bTOOLFAIL\b/, run: toolFailScenario },
+	{ match: /\bAUTHFAIL\b/, run: authFailScenario },
 	{ match: /\bERROR\b/, run: errorScenario },
 	{ match: /\bRETRY\b/, run: retryScenario },
 	{ match: /\bSLOW\b/, run: slowScenario },
@@ -255,6 +256,11 @@ async function toolFailScenario() {
 async function errorScenario() {
 	startAssistant();
 	endAssistant([], "error", "Connection error.");
+}
+
+async function authFailScenario() {
+	startAssistant();
+	endAssistant([], "error", "401 Unauthorized: invalid API key");
 }
 
 async function retryScenario() {

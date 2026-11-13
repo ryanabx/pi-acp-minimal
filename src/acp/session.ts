@@ -19,7 +19,7 @@ import type {
 	PiThinkingLevel,
 } from "../pi/rpc-types.js";
 import type { ClientPort, SessionUpdate } from "./client-port.js";
-import { errorMessage, internalError, invalidRequest } from "./errors.js";
+import { errorMessage, invalidRequest, providerError } from "./errors.js";
 import { ExtensionDialogs } from "./extension-dialogs.js";
 import { FileAccess } from "./file-access.js";
 import { type ReplaySession, replayMessage } from "./replay.js";
@@ -473,7 +473,7 @@ export class PiSession {
 		} catch (error) {
 			this.#turn = null;
 			this.#insertion = null;
-			throw internalError(errorMessage(error));
+			throw providerError(errorMessage(error));
 		}
 		// pi stores no user message for a prompt an extension command handled,
 		// and stores a queued one only once it gets to it.
@@ -739,7 +739,7 @@ export class PiSession {
 
 		const stopReason = this.#lastStopReason;
 		if (stopReason === "error") {
-			return turn.reject(internalError(this.#lastErrorMessage ?? "pi turn failed"));
+			return turn.reject(providerError(this.#lastErrorMessage ?? "pi turn failed"));
 		}
 		turn.resolve((stopReason && STOP_REASONS[stopReason]) ?? "end_turn");
 	}
@@ -756,10 +756,11 @@ export class PiSession {
 		this.#unpromptedRun = false;
 		const stopReason = this.#lastStopReason;
 		if (!aborted && stopReason === "error") {
+			const failure = providerError(this.#lastErrorMessage ?? "pi run failed");
 			return this.#port.foreground(this.sessionId, {
 				state: "idle",
 				stopReason: "error",
-				error: { code: -32603, message: this.#lastErrorMessage ?? "pi run failed" },
+				error: { code: failure.code, message: failure.message },
 			});
 		}
 		return this.#port.foreground(this.sessionId, {
