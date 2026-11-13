@@ -41,6 +41,8 @@ export interface PiSessionOptions {
 	/** MCP servers the client supplied, in pi's format, keyed by server name. */
 	mcpServers?: Record<string, PiMcpServerConfig>;
 	log: (message: string) => void;
+	/** Where status lines go for a client without notices: the agent message (default) or stderr. */
+	statusOutput?: "message" | "stderr";
 }
 
 /** The pi extension that registers client-supplied MCP servers; see the file for why. */
@@ -77,6 +79,7 @@ export class PiSession {
 	#port: ClientPort;
 	#client: PiRpcClient;
 	#log: (message: string) => void;
+	#statusOutput: "message" | "stderr";
 	#toolCalls: ToolCalls;
 	#dialogs: ExtensionDialogs;
 	#replaySession: ReplaySession;
@@ -120,6 +123,7 @@ export class PiSession {
 		this.cwd = options.cwd;
 		this.#port = options.client;
 		this.#log = options.log;
+		this.#statusOutput = options.statusOutput ?? "message";
 
 		const session = this;
 		this.#toolCalls = new ToolCalls({
@@ -808,7 +812,7 @@ export class PiSession {
 	 * Out-of-band information for the user: retries, extension messages and the like.
 	 *
 	 * Sent as an ACP `notice` when the client shows notices;
-	 * otherwise as an italic agent message line, which is the fallback the
+	 * otherwise on stderr when requested, or as an italic agent message line, which is the fallback the
 	 * protocol suggests. A multi-line title keeps its first line as the title
 	 * and moves the rest into the description.
 	 */
@@ -828,6 +832,11 @@ export class PiSession {
 				title: heading,
 				...(detail && heading !== detail ? { description: detail } : {}),
 			});
+			return;
+		}
+
+		if (this.#statusOutput === "stderr") {
+			this.#log(`[${level}] ${heading}${detail && heading !== detail ? `: ${detail}` : ""}`);
 			return;
 		}
 

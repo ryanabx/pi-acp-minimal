@@ -19,6 +19,7 @@ Options:
   --provider <name>     Passed through to pi as --provider
   --session-dir <path>  Passed through to pi as --session-dir
   --approve             Passed through to pi as --approve (trust project-local files)
+  --status-output <mode> Fallback notices: message (default) or stderr
   --quiet               Do not mirror pi's stderr onto this process's stderr
   --log-file <path>     Append every ACP frame, both directions, to a JSONL file
   -h, --help            Show this help
@@ -35,6 +36,7 @@ interface CliOptions {
 	piCommand?: string;
 	piArgs: string[];
 	quiet: boolean;
+	statusOutput: "message" | "stderr";
 	logFile?: string;
 }
 
@@ -43,6 +45,7 @@ export function parseArgs(argv: string[]): CliOptions | { help: true } {
 		piCommand: process.env.PI_ACP_PI_COMMAND,
 		piArgs: [],
 		quiet: false,
+		statusOutput: "message",
 		...(process.env.PI_ACP_LOG_FILE ? { logFile: process.env.PI_ACP_LOG_FILE } : {}),
 	};
 
@@ -73,6 +76,12 @@ export function parseArgs(argv: string[]): CliOptions | { help: true } {
 			case "--approve":
 				options.piArgs.push("--approve");
 				break;
+			case "--status-output": {
+				const value = next();
+				if (value !== "message" && value !== "stderr") throw new Error("--status-output expects message or stderr");
+				options.statusOutput = value;
+				break;
+			}
 			case "--quiet":
 				options.quiet = true;
 				break;
@@ -105,7 +114,7 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const { piCommand, piArgs, quiet, logFile } = parsed;
+	const { piCommand, piArgs, quiet, logFile, statusOutput } = parsed;
 	const log = (message: string) => {
 		if (!quiet && message) process.stderr.write(`[pi-acp-minimal] ${message}\n`);
 	};
@@ -116,8 +125,8 @@ async function main(): Promise<void> {
 
 	// The client's `initialize` picks the protocol: ACP v1, or the v2 draft for
 	// a client that asks for it. Only the chosen app ever starts a pi process.
-	const v1 = createPiAgentApp({ piCommand, piArgs, log });
-	const v2 = createPiAgentAppV2({ piCommand, piArgs, log });
+	const v1 = createPiAgentApp({ piCommand, piArgs, log, statusOutput });
+	const v2 = createPiAgentAppV2({ piCommand, piArgs, log, statusOutput });
 	agentProtocolRouter().withV1(v1.app).withV2(v2.app).connect(stream);
 
 	const shutdown = async () => {
