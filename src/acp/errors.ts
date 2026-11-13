@@ -43,3 +43,18 @@ export function errorMessage(error: unknown): string {
 	if (error instanceof Error) return error.message;
 	return String(error);
 }
+
+/** What a provider says when it rejects the credentials pi sent. */
+const AUTH_FAILURE =
+	/\b401\b|\bunauthorized\b|\bauthentication\b|(?:invalid|missing|expired)[ _-]*(?:api[ _-]*)?(?:key|token)/i;
+
+/**
+ * The error for a turn pi ended in its `error` state.
+ *
+ * pi reports a provider failure as text only. A rejected credential is told
+ * apart from the rest so a client can react to it: it gets ACP's
+ * `auth_required` code, with pi's message unchanged.
+ */
+export function providerError(message: string): RequestError {
+	return AUTH_FAILURE.test(message) ? authRequired(message) : internalError(message);
+}

@@ -224,6 +224,11 @@ deletes pi session files inside that store.
 Stop reasons: pi's `stop`/`toolUse` → `end_turn`, `length` → `max_tokens`,
 `aborted` (or a client cancel) → `cancelled`. A turn that ends in pi's `error`
 state is reported as a JSON-RPC error on `session/prompt`, carrying pi's message.
+When that message says the provider rejected the credentials (a 401, an invalid,
+missing or expired key or token), the error carries ACP's `auth_required` code
+(-32000) instead of the internal error code, so a client can tell a credential
+problem from the rest; pi reports provider failures as text only, so this is a
+match on the message.
 
 ### Tool calls
 

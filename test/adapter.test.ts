@@ -120,6 +120,16 @@ describe("session/prompt", () => {
 		).rejects.toThrow(/Connection error/);
 	});
 
+	it("reports a rejected credential as auth_required and recovers on the next turn", async () => {
+		const { sessionId } = await newSession();
+		await expect(
+			client.prompt({ sessionId, prompt: [{ type: "text", text: "AUTHFAIL" }] }),
+		).rejects.toMatchObject({ code: -32000, message: "401 Unauthorized: invalid API key" });
+		expect(await client.prompt({ sessionId, prompt: [{ type: "text", text: "TEXT" }] })).toEqual({
+			stopReason: "end_turn",
+		});
+	});
+
 	it("reports auto-retry progress and still completes", async () => {
 		const { sessionId } = await newSession();
 		const response = await client.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
