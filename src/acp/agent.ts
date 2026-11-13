@@ -42,6 +42,7 @@ export interface PiAcpAgentOptions {
 	piArgs: string[];
 	env?: NodeJS.ProcessEnv;
 	log: (message: string) => void;
+	statusOutput?: "message" | "stderr";
 }
 
 /** This package's own name and version, reported to the client as `agentInfo`. */
@@ -292,6 +293,7 @@ export class PiAcpAgent {
 			resumeSessionFile,
 			mcpServers: toPiMcpServers(mcpServers, this.#options.log),
 			log: this.#options.log,
+			statusOutput: this.#options.statusOutput,
 		});
 
 		try {

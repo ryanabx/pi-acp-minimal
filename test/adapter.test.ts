@@ -509,6 +509,19 @@ describe("extension dialogs as elicitations", () => {
 });
 
 describe("notices", () => {
+	it("keeps fallback notices out of reply text when stderr is selected", async () => {
+		const { client: fresh, workspace, cleanup: done } = createTestClient({ extraArgs: ["--status-output", "stderr"] });
+		try {
+			await fresh.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+			const { sessionId } = await fresh.newSession({ cwd: workspace, mcpServers: [] });
+			await fresh.prompt({ sessionId, prompt: [{ type: "text", text: "NOTIFY me" }] });
+			await fresh.prompt({ sessionId, prompt: [{ type: "text", text: "RETRY please" }] });
+			expect(fresh.agentText()).not.toMatch(/heads up|Retrying|Retry succeeded/);
+			expect(fresh.stderr.join("")).toMatch(/heads up/);
+			expect(fresh.stderr.join("")).toMatch(/Overloaded/);
+		} finally { done(); }
+	});
+
 	it("sends pi's status messages as notices to a client that supports them", async () => {
 		const { client: noticing, sessionId, done } = await clientWith({ session: { notices: {} } });
 		try {

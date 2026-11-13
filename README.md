@@ -81,11 +81,18 @@ model list.
 | `--session-dir <path>` | Forwarded to pi as `--session-dir` |
 | `--approve` | Forwarded to pi as `--approve` (trust project-local extensions/skills) |
 | `--log-file <path>` | Append every ACP frame, both directions, to a JSONL file |
+| `--status-output <mode>` | Where status lines go for a client without notices: `message` (default) or `stderr` |
 | `--quiet` | Do not mirror pi's stderr |
 | `-- <args...>` | Everything after `--` is forwarded verbatim to every pi process |
 
 `--log-file` captures full ACP frames, which include prompt text and any file
 contents that flow through tool calls. Use it for debugging, not routinely.
+
+`--status-output stderr` is for clients that parse the agent's reply: a client
+that does not advertise `session.notices` otherwise receives pi's status lines
+(retries, extension notifications, compaction) as italic text inside the agent
+message. With `stderr` they are written to the adapter's stderr instead, and
+`--quiet` drops them. Clients that advertise notices are not affected.
 
 ## Protocol versions
 
